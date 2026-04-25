@@ -673,6 +673,12 @@ static void node_to_code(TreeNode* tree, char* buf, int bufsize) {
     strncat(buf, "[", bufsize - strlen(buf) - 1);
     if (tree->child_count > 0) {
       node_to_code(tree->children[0], buf, bufsize);
+      for (int i = 1; i < tree->child_count; ++i) {
+        if (is_postfix_label(tree->children[i]->label))
+          append_postfix_node(tree->children[i], buf, bufsize);
+        else
+          node_to_code(tree->children[i], buf, bufsize);
+      }
     }
     strncat(buf, "]", bufsize - strlen(buf) - 1);
     return;
@@ -718,10 +724,11 @@ static void node_to_code(TreeNode* tree, char* buf, int bufsize) {
         }
         snprintf(rhs, sizeof(rhs), "%s(%s)", callee, args);
       } else {
-        for (int i = rhs_start; i < tree->child_count; i++) {
-          if (i > rhs_start) strncat(rhs, " ", sizeof(rhs) - strlen(rhs) - 1);
-          node_to_code(tree->children[i], rhs, sizeof(rhs));
-        }
+        TreeNode temp = {.label = "",
+                         .children = tree->children + rhs_start,
+                         .child_count = tree->child_count - rhs_start,
+                         .capacity = 0};
+        node_to_code(&temp, rhs, sizeof(rhs));
       }
     }
     snprintf(buf + strlen(buf), bufsize - strlen(buf), "%s = %s", lhs, rhs);

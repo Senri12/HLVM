@@ -7,6 +7,8 @@
 #include <string.h>
 
 enum { JVM_MAX_LABELS = 512, JVM_MAX_FIXUPS = 512, JVM_MAX_LOCALS = 256 };
+#define JVM_HEAP_SLOTS 16384
+#define JVM_CLASS_NAME "SimpleLangProgram"
 
 typedef struct {
   unsigned char* data;
@@ -29,6 +31,7 @@ typedef struct {
   char* name;
   int slot;
   int is_ref;
+  char* type_name;
 } JvmLocal;
 
 typedef struct {
@@ -233,7 +236,10 @@ static void free_method_gen(JvmMethodGen* g) {
   if (!g) return;
   for (i = 0; i < g->label_count; ++i) free(g->labels[i].name);
   for (i = 0; i < g->fixup_count; ++i) free(g->fixups[i].label);
-  for (i = 0; i < g->local_count; ++i) free(g->locals[i].name);
+  for (i = 0; i < g->local_count; ++i) {
+    free(g->locals[i].name);
+    free(g->locals[i].type_name);
+  }
   for (i = 0; i < g->invoke_fixup_count; ++i) {
     free(g->invoke_fixups[i].name);
     free(g->invoke_fixups[i].desc);
@@ -270,6 +276,26 @@ static int local_is_ref(JvmMethodGen* g, const char* name) {
   for (i = 0; i < g->local_count; ++i)
     if (strcmp(g->locals[i].name, name) == 0) return g->locals[i].is_ref;
   return 0;
+}
+
+static void local_set_type(JvmMethodGen* g, const char* name, const char* type_name) {
+  int i;
+  if (!g || !name || !type_name) return;
+  for (i = 0; i < g->local_count; ++i) {
+    if (strcmp(g->locals[i].name, name) == 0) {
+      free(g->locals[i].type_name);
+      g->locals[i].type_name = jvm_strdup(type_name);
+      return;
+    }
+  }
+}
+
+static const char* local_get_type(JvmMethodGen* g, const char* name) {
+  int i;
+  if (!g || !name) return NULL;
+  for (i = 0; i < g->local_count; ++i)
+    if (strcmp(g->locals[i].name, name) == 0) return g->locals[i].type_name;
+  return NULL;
 }
 
 static void emit_iconst(JvmMethodGen* g, int value) {
@@ -335,6 +361,18 @@ static void emit_astore(JvmMethodGen* g, int slot) {
   }
 }
 
+/* marker values for constant-pool placeholders */
+enum {
+  JVM_MARKER_SYS_OUT    = 0xfff1,
+  JVM_MARKER_SYS_IN     = 0xfff2,
+  JVM_MARKER_PS_PRINT   = 0xfff3,
+  JVM_MARKER_IS_READ    = 0xfff4,
+  JVM_MARKER_INVOKE_USR = 0xfff5,
+  JVM_MARKER_HEAP_FIELD = 0xfff6,
+  JVM_MARKER_HP_FIELD   = 0xfff7,
+  JVM_MARKER_ALLOC_MTH  = 0xfff8
+};
+
 static void emit_invokestatic_user(JvmMethodGen* g, const char* name,
                                    const char* desc, const char* text) {
   if (!g || !name || !desc || g->invoke_fixup_count >= JVM_MAX_FIXUPS) return;
@@ -344,7 +382,7 @@ static void emit_invokestatic_user(JvmMethodGen* g, const char* name,
   g->invoke_fixups[g->invoke_fixup_count].name = jvm_strdup(name);
   g->invoke_fixups[g->invoke_fixup_count].desc = jvm_strdup(desc);
   g->invoke_fixup_count++;
-  bv_u2(&g->code, 0xfff5);
+  bv_u2(&g->code, JVM_MARKER_INVOKE_USR);
 }
 
 static int parse_int_literal(const char* s, int* out) {
@@ -429,6 +467,17 @@ static int is_ident_text(const char* s) {
   return 1;
 }
 
+/* Accept "ident" or "ident.ident" as a valid array-base name. */
+static int is_valid_array_base(const char* s) {
+  const char* dot;
+  char part[128];
+  if (!s) return 0;
+  dot = strchr(s, '.');
+  if (!dot) return is_ident_text(s);
+  snprintf(part, sizeof(part), "%.*s", (int)(dot - s), s);
+  return is_ident_text(part) && is_ident_text(dot + 1);
+}
+
 static int split_array_access(const char* text, char* name, size_t name_sz,
                               char* index, size_t index_sz) {
   const char* lb;
@@ -441,7 +490,7 @@ static int split_array_access(const char* text, char* name, size_t name_sz,
   snprintf(index, index_sz, "%.*s", (int)(rb - lb - 1), lb + 1);
   trim(name);
   trim(index);
-  return is_ident_text(name) && index[0] != '\0';
+  return is_valid_array_base(name) && index[0] != '\0';
 }
 
 static int split_top_binary(const char* expr, char* lhs, size_t lhs_sz,
@@ -541,20 +590,32 @@ static int split_call(const char* expr, char* name, size_t name_sz,
   return 1;
 }
 
-static const char* jvm_func_name(FunctionCFG* f) {
-  return (f && f->func_name) ? f->func_name : "unknown";
+/* Sanitize a name for use as a JVM method/field identifier.
+   Replaces characters illegal in JVM names (<>[]/ etc.) with '_'. */
+static char* jvm_sanitize_name(const char* s) {
+  char* out;
+  int i;
+  if (!s) s = "unknown";
+  out = jvm_strdup(s);
+  for (i = 0; out[i]; ++i) {
+    char c = out[i];
+    if (c == '<' || c == '>' || c == '[' || c == ']' || c == '/' ||
+        c == ';' || c == '.' || c == ' ')
+      out[i] = '_';
+  }
+  return out;
+}
+
+static char* jvm_func_name(FunctionCFG* f) {
+  return jvm_sanitize_name((f && f->func_name) ? f->func_name : "unknown");
 }
 
 static const char* jvm_ret_desc(FunctionCFG* f) {
-  if (!f || !f->return_type || strcmp(f->return_type, "void") != 0) {
-    if (f && f->return_type && strchr(f->return_type, '[')) return "[I";
-    return "I";
-  }
-  return "V";
+  if (f && f->return_type && strcmp(f->return_type, "void") == 0) return "V";
+  return "I";
 }
 
 static const char* jvm_type_desc(const char* type_name) {
-  if (type_name && strchr(type_name, '[')) return "[I";
   if (type_name && strcmp(type_name, "void") == 0) return "V";
   return "I";
 }
@@ -572,6 +633,342 @@ static char* jvm_method_desc(FunctionCFG* f) {
   strncat(buf, ")", sizeof(buf) - strlen(buf) - 1);
   strncat(buf, jvm_ret_desc(f), sizeof(buf) - strlen(buf) - 1);
   return jvm_strdup(buf);
+}
+
+/* ---- HEAP-based object/array model helpers ---- */
+
+static UserTypeInfo* jvm_find_utype(AnalysisResult* res, const char* type_name) {
+  int i;
+  if (!res || !type_name) return NULL;
+  for (i = 0; i < res->type_count; ++i) {
+    if (res->types[i].name && strcmp(res->types[i].name, type_name) == 0)
+      return &res->types[i];
+  }
+  return NULL;
+}
+
+static int jvm_field_slot_of_type(AnalysisResult* res, const char* type_name,
+                                   const char* field_name) {
+  UserTypeInfo* type = jvm_find_utype(res, type_name);
+  int i;
+  if (!type) return 0;
+  for (i = 0; i < type->field_count; ++i) {
+    if (strcmp(type->fields[i].name, field_name) == 0)
+      return type->fields[i].offset / 4;
+  }
+  return 0;
+}
+
+static const char* jvm_field_type_of_type(AnalysisResult* res,
+                                           const char* type_name,
+                                           const char* field_name) {
+  UserTypeInfo* type = jvm_find_utype(res, type_name);
+  int i;
+  if (!type) return NULL;
+  for (i = 0; i < type->field_count; ++i)
+    if (strcmp(type->fields[i].name, field_name) == 0)
+      return type->fields[i].type_name;
+  return NULL;
+}
+
+static int jvm_parse_type_args(const char* type_name, char out[][128],
+                               int max_args) {
+  const char* lt;
+  const char* p;
+  char token[256];
+  int token_len = 0;
+  int depth = 0;
+  int count = 0;
+  if (!type_name || !out || max_args <= 0) return 0;
+  lt = strchr(type_name, '<');
+  if (!lt) return 0;
+  for (p = lt + 1; *p; ++p) {
+    if (*p == '>' && depth == 0) {
+      if (token_len > 0 && count < max_args) {
+        token[token_len] = '\0';
+        snprintf(out[count], 128, "%s", token);
+        trim(out[count++]);
+      }
+      break;
+    }
+    if (*p == ',' && depth == 0) {
+      if (token_len > 0 && count < max_args) {
+        token[token_len] = '\0';
+        snprintf(out[count], 128, "%s", token);
+        trim(out[count++]);
+      }
+      token_len = 0;
+      continue;
+    }
+    if (*p == '<') depth++;
+    else if (*p == '>' && depth > 0) depth--;
+    if (token_len + 1 < (int)sizeof(token)) token[token_len++] = *p;
+  }
+  return count;
+}
+
+static const char* jvm_resolve_template_type(AnalysisResult* res,
+                                             const char* owner_type_name,
+                                             const char* field_type_name) {
+  static char resolved[256];
+  char base_name[128];
+  char actual_args[16][128];
+  UserTypeInfo* base_type;
+  const char* lt;
+  const char* p;
+  int argc;
+  int out = 0;
+  if (!field_type_name) return NULL;
+  if (!owner_type_name || !strchr(owner_type_name, '<')) return field_type_name;
+  lt = strchr(owner_type_name, '<');
+  snprintf(base_name, sizeof(base_name), "%.*s", (int)(lt - owner_type_name),
+           owner_type_name);
+  trim(base_name);
+  base_type = jvm_find_utype(res, base_name);
+  argc = jvm_parse_type_args(owner_type_name, actual_args, 16);
+  if (!base_type || base_type->template_param_count <= 0 || argc <= 0)
+    return field_type_name;
+
+  for (p = field_type_name; *p && out + 1 < (int)sizeof(resolved);) {
+    if (isalpha((unsigned char)*p) || *p == '_') {
+      char ident[128];
+      int ident_len = 0;
+      int replaced = 0;
+      int i;
+      while ((isalnum((unsigned char)*p) || *p == '_') &&
+             ident_len + 1 < (int)sizeof(ident)) {
+        ident[ident_len++] = *p++;
+      }
+      ident[ident_len] = '\0';
+      for (i = 0; i < base_type->template_param_count && i < argc; ++i) {
+        if (strcmp(base_type->template_params[i], ident) == 0) {
+          int n = (int)strlen(actual_args[i]);
+          if (out + n >= (int)sizeof(resolved))
+            n = (int)sizeof(resolved) - out - 1;
+          memcpy(resolved + out, actual_args[i], (size_t)n);
+          out += n;
+          replaced = 1;
+          break;
+        }
+      }
+      if (!replaced) {
+        int n = (int)strlen(ident);
+        if (out + n >= (int)sizeof(resolved))
+          n = (int)sizeof(resolved) - out - 1;
+        memcpy(resolved + out, ident, (size_t)n);
+        out += n;
+      }
+      continue;
+    }
+    resolved[out++] = *p++;
+  }
+  resolved[out] = '\0';
+  return resolved;
+}
+
+static int jvm_instance_slots(AnalysisResult* res, const char* type_name) {
+  UserTypeInfo* type = jvm_find_utype(res, type_name);
+  if (!type || type->instance_size <= 0) return 0;
+  return (type->instance_size + 3) / 4;
+}
+
+static int split_member_access(const char* expr, char* owner, size_t osz,
+                                char* field, size_t fsz) {
+  const char* dot;
+  if (!expr) return 0;
+  dot = strchr(expr, '.');
+  if (!dot) return 0;
+  if (strchr(dot + 1, '(')) return 0; /* method call, not field */
+  if (strchr(dot + 1, '.')) return 0; /* nested access, too complex */
+  snprintf(owner, osz, "%.*s", (int)(dot - expr), expr);
+  snprintf(field, fsz, "%s", dot + 1);
+  trim(owner);
+  trim(field);
+  return owner[0] != '\0' && field[0] != '\0' && is_ident_text(field);
+}
+
+static int split_member_call_text(const char* work, char* owner, size_t osz,
+                                   char* method_out, size_t msz,
+                                   char args[][128], int* argc) {
+  const char* lp;
+  const char* p;
+  const char* dot = NULL;
+  char tmp[512];
+  char dummy[128];
+  lp = strchr(work, '(');
+  if (!lp) return 0;
+  for (p = lp - 1; p >= work; p--) {
+    if (*p == '.') { dot = p; break; }
+    if (!isalnum((unsigned char)*p) && *p != '_') break;
+  }
+  if (!dot || dot == work) return 0;
+  snprintf(owner, osz, "%.*s", (int)(dot - work), work);
+  trim(owner);
+  if (!is_ident_text(owner) && strcmp(owner, "this") != 0) return 0;
+  snprintf(tmp, sizeof(tmp), "%.*s%s", (int)(lp - dot - 1), dot + 1, lp);
+  return split_call(tmp, method_out, msz, args, argc);
+}
+
+static int jvm_field_idx(JvmMethodGen* g, const char* owner_name,
+                          const char* field_name) {
+  const char* tname;
+  if (strcmp(owner_name, "this") == 0)
+    tname = (g->function) ? g->function->owner_type : NULL;
+  else
+    tname = local_get_type(g, owner_name);
+  if (!tname) return 0;
+  return jvm_field_slot_of_type(g->analysis, tname, field_name);
+}
+
+static const char* jvm_owner_field_type(JvmMethodGen* g, const char* owner_name,
+                                         const char* field_name) {
+  const char* tname;
+  const char* field_type;
+  if (strcmp(owner_name, "this") == 0)
+    tname = (g->function) ? g->function->owner_type : NULL;
+  else
+    tname = local_get_type(g, owner_name);
+  if (!tname) return NULL;
+  field_type = jvm_field_type_of_type(g->analysis, tname, field_name);
+  return jvm_resolve_template_type(g->analysis, tname, field_type);
+}
+
+/* Forward declarations */
+static FunctionCFG* find_function_arity(AnalysisResult* res, const char* name, int argc);
+
+/* Infer type of an expression (no bytecode emitted). */
+static const char* infer_expr_type(JvmMethodGen* g, const char* expr);
+
+static const char* infer_expr_type(JvmMethodGen* g, const char* expr) {
+  char work[512];
+  char owner[128], field[128];
+  char base[128], idx[128];
+  char cname[128];
+  char args[16][128];
+  int argc = 0;
+  FunctionCFG* f;
+  if (!expr || !g) return "int";
+  snprintf(work, sizeof(work), "%s", expr);
+  trim(work);
+  if (!work[0]) return "int";
+  /* member access: this.field or obj.field */
+  if (split_member_access(work, owner, sizeof(owner), field, sizeof(field))) {
+    const char* ft = jvm_owner_field_type(g, owner, field);
+    return ft ? ft : "int";
+  }
+  /* array element: base[idx] */
+  if (split_array_access(work, base, sizeof(base), idx, sizeof(idx))) {
+    const char* bt = infer_expr_type(g, base);
+    /* strip array suffix from bt */
+    if (bt) {
+      const char* lb = strchr(bt, '[');
+      if (lb && lb > bt) {
+        static char elem[128];
+        snprintf(elem, sizeof(elem), "%.*s", (int)(lb - bt), bt);
+        trim(elem);
+        return elem;
+      }
+    }
+    return "int";
+  }
+  /* function call */
+  if (split_call(work, cname, sizeof(cname), args, &argc)) {
+    f = find_function_arity(g->analysis, cname, argc);
+    return (f && f->return_type) ? f->return_type : "int";
+  }
+  /* simple local */
+  {
+    const char* lt = local_get_type(g, work);
+    return lt ? lt : "int";
+  }
+}
+
+/* Find best matching global function using inferred arg types. */
+static FunctionCFG* find_function_typed(JvmMethodGen* g, const char* name,
+                                         char args[][128], int argc) {
+  int i, j;
+  FunctionCFG* fallback = NULL;
+  const char* arg_types[16];
+  for (i = 0; i < argc && i < 16; ++i)
+    arg_types[i] = infer_expr_type(g, args[i]);
+  for (i = 0; i < g->analysis->files_count; ++i) {
+    SourceFileInfo* sf = g->analysis->files[i];
+    if (!sf) continue;
+    for (j = 0; j < sf->functions_count; ++j) {
+      FunctionCFG* f = sf->functions[j];
+      if (!f || f->owner_type) continue;
+      if (f->source_name && strcmp(f->source_name, name) == 0) {
+        if (f->param_count == argc) {
+          int match = 1;
+          int pi;
+          for (pi = 0; pi < argc; ++pi) {
+            if (arg_types[pi] && f->param_types && f->param_types[pi] &&
+                strcmp(arg_types[pi], f->param_types[pi]) != 0) {
+              match = 0;
+              break;
+            }
+          }
+          if (match) return f;
+          if (!fallback) fallback = f;
+        }
+      }
+    }
+  }
+  return fallback ? fallback : find_function_arity(g->analysis, name, argc);
+}
+
+/* Find method CFG for owner type + source name + user-visible argc
+   (does not count the implicit 'this' param). */
+static FunctionCFG* find_method_cfg(AnalysisResult* res,
+                                     const char* owner_type,
+                                     const char* source_name, int user_argc) {
+  int i, j;
+  FunctionCFG* fallback = NULL;
+  if (!res || !owner_type || !source_name) return NULL;
+  for (i = 0; i < res->files_count; ++i) {
+    SourceFileInfo* sf = res->files[i];
+    if (!sf) continue;
+    for (j = 0; j < sf->functions_count; ++j) {
+      FunctionCFG* f = sf->functions[j];
+      if (!f || !f->owner_type) continue;
+      if (strcmp(f->owner_type, owner_type) != 0) continue;
+      if (!f->source_name || strcmp(f->source_name, source_name) != 0) continue;
+      if (f->param_count == user_argc + 1) return f;
+      if (!fallback) fallback = f;
+    }
+  }
+  return fallback;
+}
+
+/* ---- HEAP bytecode emitters ---- */
+
+static void emit_getstatic_heap(JvmMethodGen* g) {
+  emit_u2_arg(g, 0xb2, JVM_MARKER_HEAP_FIELD,
+              "getstatic " JVM_CLASS_NAME "/HEAP [I");
+}
+
+static void emit_alloc_call(JvmMethodGen* g) {
+  emit_u2_arg(g, 0xb8, JVM_MARKER_ALLOC_MTH,
+              "invokestatic " JVM_CLASS_NAME "/alloc(I)I");
+}
+
+/* Push the base address (int) of an array onto the JVM operand stack.
+   The base may be a simple local or a field of an object. */
+static void emit_push_array_base(JvmMethodGen* g, const char* base_expr);
+
+static void emit_push_array_base(JvmMethodGen* g, const char* base_expr) {
+  char owner[128], field[128];
+  if (split_member_access(base_expr, owner, sizeof(owner), field, sizeof(field))) {
+    int ptr_slot = local_slot(g, owner, 0);
+    int fi = jvm_field_idx(g, owner, field);
+    emit_getstatic_heap(g);
+    emit_iload(g, ptr_slot);
+    emit_iconst(g, fi);
+    emit_u1(g, 0x60, "iadd");
+    emit_u1(g, 0x2e, "iaload");
+  } else {
+    emit_iload(g, local_slot(g, base_expr, 0));
+  }
 }
 
 static FunctionCFG* find_function(AnalysisResult* res, const char* name) {
@@ -785,8 +1182,8 @@ static void eval_call(JvmMethodGen* g, const char* name, char args[][128],
   if (strcmp(name, "in") == 0 && argc == 0) {
     char* eof_ok = jvm_strdupf("L_jvm_in_ok_%s_%d", jvm_func_name(g->function),
                                g->temp_label_counter++);
-    emit_u2_arg(g, 0xb2, 0xfff2, "getstatic java/lang/System/in Ljava/io/InputStream;");
-    emit_u2_arg(g, 0xb6, 0xfff4, "invokevirtual java/io/InputStream/read()I");
+    emit_u2_arg(g, 0xb2, JVM_MARKER_SYS_IN, "getstatic java/lang/System/in Ljava/io/InputStream;");
+    emit_u2_arg(g, 0xb6, JVM_MARKER_IS_READ, "invokevirtual java/io/InputStream/read()I");
     emit_u1(g, 0x59, "dup");
     emit_branch(g, 0x9c, eof_ok, "ifge");
     emit_u1(g, 0x57, "pop");
@@ -795,11 +1192,27 @@ static void eval_call(JvmMethodGen* g, const char* name, char args[][128],
     free(eof_ok);
     return;
   }
+  /* unqualified method call within current class: prepend 'this' */
+  if (g->function && g->function->owner_type) {
+    FunctionCFG* mf = find_method_cfg(g->analysis, g->function->owner_type,
+                                      name, argc);
+    if (mf) {
+      emit_iload(g, local_slot(g, "this", 0));
+      for (i = 0; i < argc; ++i) eval_expr(g, args[i]);
+      desc = jvm_method_desc(mf);
+      snprintf(line, sizeof(line), "invokestatic " JVM_CLASS_NAME "/%s%s",
+               jvm_func_name(mf), desc);
+      emit_invokestatic_user(g, jvm_func_name(mf), desc, line);
+      free(desc);
+      return;
+    }
+  }
+  /* global function call with type-aware overload resolution */
   for (i = 0; i < argc; ++i) eval_expr(g, args[i]);
-  f = find_function_arity(g->analysis, name, argc);
-  if (!f) f = find_function(g->analysis, jvm_func_name(g->function));
+  f = find_function_typed(g, name, args, argc);
+  if (!f) f = find_function(g->analysis, name);
   desc = jvm_method_desc(f);
-  snprintf(line, sizeof(line), "invokestatic SimpleLangProgram/%s%s",
+  snprintf(line, sizeof(line), "invokestatic " JVM_CLASS_NAME "/%s%s",
            jvm_func_name(f), desc);
   emit_invokestatic_user(g, jvm_func_name(f), desc, line);
   free(desc);
@@ -927,13 +1340,60 @@ static void eval_expr(JvmMethodGen* g, const char* expr) {
     else emit_u1(g, 0x70, "irem");
     return;
   }
+  /* member call: obj.method(args) returns a value */
+  {
+    char mc_owner[128], mc_method[128];
+    char mc_args[16][128];
+    int mc_argc = 0;
+    if (split_member_call_text(work, mc_owner, sizeof(mc_owner),
+                               mc_method, sizeof(mc_method), mc_args, &mc_argc)) {
+      const char* otype = (strcmp(mc_owner, "this") == 0 && g->function)
+                          ? g->function->owner_type
+                          : local_get_type(g, mc_owner);
+      if (otype) {
+        FunctionCFG* mf = find_method_cfg(g->analysis, otype, mc_method, mc_argc);
+        if (mf) {
+          int mi;
+          emit_iload(g, local_slot(g, mc_owner, 0));
+          for (mi = 0; mi < mc_argc; ++mi) eval_expr(g, mc_args[mi]);
+          {
+            char* mdesc = jvm_method_desc(mf);
+            char mline[512];
+            snprintf(mline, sizeof(mline), "invokestatic " JVM_CLASS_NAME "/%s%s",
+                     jvm_func_name(mf), mdesc);
+            emit_invokestatic_user(g, jvm_func_name(mf), mdesc, mline);
+            free(mdesc);
+          }
+          return;
+        }
+      }
+    }
+  }
   if (split_call(work, name, sizeof(name), args, &argc)) {
     eval_call(g, name, args, argc);
     return;
   }
+  /* member field access: this.field or obj.field */
+  {
+    char ma_owner[128], ma_field[128];
+    if (split_member_access(work, ma_owner, sizeof(ma_owner),
+                            ma_field, sizeof(ma_field))) {
+      int ptr_slot = local_slot(g, ma_owner, 0);
+      int fi = jvm_field_idx(g, ma_owner, ma_field);
+      emit_getstatic_heap(g);
+      emit_iload(g, ptr_slot);
+      emit_iconst(g, fi);
+      emit_u1(g, 0x60, "iadd");
+      emit_u1(g, 0x2e, "iaload");
+      return;
+    }
+  }
+  /* array element access: arr[i] or this.arr[i] using HEAP */
   if (split_array_access(work, name, sizeof(name), index, sizeof(index))) {
-    emit_aload(g, local_slot(g, name, 1));
+    emit_getstatic_heap(g);
+    emit_push_array_base(g, name);
     eval_expr(g, index);
+    emit_u1(g, 0x60, "iadd");
     emit_u1(g, 0x2e, "iaload");
     return;
   }
@@ -949,8 +1409,7 @@ static void eval_expr(JvmMethodGen* g, const char* expr) {
     emit_iconst(g, value);
     return;
   }
-  if (local_is_ref(g, work)) emit_aload(g, local_slot(g, work, 1));
-  else emit_iload(g, local_slot(g, work, 1));
+  emit_iload(g, local_slot(g, work, 1));
 }
 
 static void emit_condition_branch(JvmMethodGen* g, const char* cond,
@@ -983,20 +1442,20 @@ static char* node_label(FunctionCFG* f, CFGNode* n) {
 }
 
 static void emit_out_char_expr(JvmMethodGen* g, const char* expr) {
-  emit_u2_arg(g, 0xb2, 0xfff1,
+  emit_u2_arg(g, 0xb2, JVM_MARKER_SYS_OUT,
               "getstatic java/lang/System/out Ljava/io/PrintStream;");
   eval_expr(g, expr);
   emit_u1(g, 0x92, "i2c");
-  emit_u2_arg(g, 0xb6, 0xfff3,
+  emit_u2_arg(g, 0xb6, JVM_MARKER_PS_PRINT,
               "invokevirtual java/io/PrintStream/print(C)V");
 }
 
 static void emit_out_char_value(JvmMethodGen* g, int value) {
-  emit_u2_arg(g, 0xb2, 0xfff1,
+  emit_u2_arg(g, 0xb2, JVM_MARKER_SYS_OUT,
               "getstatic java/lang/System/out Ljava/io/PrintStream;");
   emit_iconst(g, value);
   emit_u1(g, 0x92, "i2c");
-  emit_u2_arg(g, 0xb6, 0xfff3,
+  emit_u2_arg(g, 0xb6, JVM_MARKER_PS_PRINT,
               "invokevirtual java/io/PrintStream/print(C)V");
 }
 
@@ -1014,20 +1473,38 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
   if (starts_with(work, "decl ")) {
     name[0] = expr[0] = '\0';
     if (sscanf(work, "decl %127s %127s = %383[^\n]", type_name, name, expr) >= 2) {
+      trim(type_name);
       trim(name);
       trim(expr);
+      /* Remove trailing ';' from name and expr if any */
+      { int ilen = (int)strlen(name);
+        if (ilen > 0 && name[ilen-1] == ';') name[ilen-1] = '\0'; }
+      { int ilen = (int)strlen(expr);
+        if (ilen > 0 && expr[ilen-1] == ';') expr[ilen-1] = '\0'; }
+      /* Array declaration: name has form foo[N] */
       if (split_array_access(name, array_name, sizeof(array_name), array_index,
                              sizeof(array_index))) {
         local_slot(g, array_name, 1);
-        mark_local_ref(g, array_name);
+        local_set_type(g, array_name, type_name);
         eval_expr(g, array_index);
-        if (g->listing) fprintf(g->listing, "    newarray int\n");
-        bv_u1(&g->code, 0xbc);
-        bv_u1(&g->code, 10);
-        emit_astore(g, local_slot(g, array_name, 1));
+        emit_alloc_call(g);
+        emit_istore(g, local_slot(g, array_name, 1));
         return;
       }
       local_slot(g, name, 1);
+      local_set_type(g, name, type_name);
+      /* User-defined type without explicit initializer: allocate object */
+      if (!expr[0] && jvm_find_utype(g->analysis, type_name)) {
+        int n_slots = jvm_instance_slots(g->analysis, type_name);
+        if (n_slots > 0) {
+          emit_iconst(g, n_slots);
+          emit_alloc_call(g);
+        } else {
+          emit_iconst(g, 0);
+        }
+        emit_istore(g, local_slot(g, name, 1));
+        return;
+      }
       if (expr[0]) eval_expr(g, expr);
       else emit_iconst(g, 0);
       emit_istore(g, local_slot(g, name, 1));
@@ -1049,6 +1526,36 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
     g->terminated = 1;
     return;
   }
+  /* member call statement: obj.method(args) */
+  {
+    char mc_owner[128], mc_method[128];
+    char mc_args[16][128];
+    int mc_argc = 0;
+    if (split_member_call_text(work, mc_owner, sizeof(mc_owner),
+                               mc_method, sizeof(mc_method), mc_args, &mc_argc)) {
+      const char* otype = (strcmp(mc_owner, "this") == 0 && g->function)
+                          ? g->function->owner_type
+                          : local_get_type(g, mc_owner);
+      if (otype) {
+        FunctionCFG* mf = find_method_cfg(g->analysis, otype, mc_method, mc_argc);
+        if (mf) {
+          int mi;
+          char* mdesc;
+          char mline[512];
+          emit_iload(g, local_slot(g, mc_owner, 0));
+          for (mi = 0; mi < mc_argc; ++mi) eval_expr(g, mc_args[mi]);
+          mdesc = jvm_method_desc(mf);
+          snprintf(mline, sizeof(mline), "invokestatic " JVM_CLASS_NAME "/%s%s",
+                   jvm_func_name(mf), mdesc);
+          emit_invokestatic_user(g, jvm_func_name(mf), mdesc, mline);
+          free(mdesc);
+          if (mf->return_type && strcmp(mf->return_type, "void") != 0)
+            emit_u1(g, 0x57, "pop");
+          return;
+        }
+      }
+    }
+  }
   if (split_call(work, call_name, sizeof(call_name), args, &argc)) {
     if (strcmp(call_name, "out") == 0 && argc == 1) {
       char str_value[512];
@@ -1063,28 +1570,50 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
       return;
     }
     eval_call(g, call_name, args, argc);
-    if (strcmp(jvm_ret_desc(find_function_arity(g->analysis, call_name, argc)), "V") != 0) {
-      emit_u1(g, 0x57, "pop");
+    {
+      FunctionCFG* cf = find_function_typed(g, call_name, args, argc);
+      if (cf && strcmp(jvm_ret_desc(cf), "V") != 0)
+        emit_u1(g, 0x57, "pop");
     }
     return;
   }
   eq = strchr(work, '=');
-  if (eq && (eq == work || eq[-1] != '=')) {
+  if (eq && (eq == work || (eq[-1] != '!' && eq[-1] != '<' &&
+                             eq[-1] != '>' && eq[-1] != '=')) &&
+      eq[1] != '=') {
     snprintf(name, sizeof(name), "%.*s", (int)(eq - work), work);
     snprintf(expr, sizeof(expr), "%s", eq + 1);
     trim(name);
     trim(expr);
+    /* member field assignment: this.field = expr or obj.field = expr */
+    {
+      char ma_owner[128], ma_field[128];
+      if (split_member_access(name, ma_owner, sizeof(ma_owner),
+                              ma_field, sizeof(ma_field))) {
+        int ptr_slot = local_slot(g, ma_owner, 0);
+        int fi = jvm_field_idx(g, ma_owner, ma_field);
+        emit_getstatic_heap(g);
+        emit_iload(g, ptr_slot);
+        emit_iconst(g, fi);
+        emit_u1(g, 0x60, "iadd");
+        eval_expr(g, expr);
+        emit_u1(g, 0x4f, "iastore");
+        return;
+      }
+    }
+    /* array element assignment: arr[i] = expr (HEAP-based) */
     if (split_array_access(name, array_name, sizeof(array_name), array_index,
                            sizeof(array_index))) {
-      emit_aload(g, local_slot(g, array_name, 1));
+      emit_getstatic_heap(g);
+      emit_push_array_base(g, array_name);
       eval_expr(g, array_index);
+      emit_u1(g, 0x60, "iadd");
       eval_expr(g, expr);
       emit_u1(g, 0x4f, "iastore");
       return;
     }
     eval_expr(g, expr);
-    if (local_is_ref(g, name)) emit_astore(g, local_slot(g, name, 1));
-    else emit_istore(g, local_slot(g, name, 1));
+    emit_istore(g, local_slot(g, name, 1));
   }
 }
 
@@ -1174,9 +1703,8 @@ static JvmMethod compile_function(FunctionCFG* f, AnalysisResult* res,
 
   for (i = 0; i < f->param_count; ++i) {
     local_slot(&g, f->params[i], 1);
-    if (f->param_types && f->param_types[i] && strchr(f->param_types[i], '[')) {
-      mark_local_ref(&g, f->params[i]);
-    }
+    if (f->param_types && f->param_types[i])
+      local_set_type(&g, f->params[i], f->param_types[i]);
   }
 
   for (i = 0; i < f->node_count; ++i) emit_node(&g, f->nodes[i]);
@@ -1290,8 +1818,38 @@ static void free_methods(JvmMethod* methods, int count) {
   free(methods);
 }
 
+/* Patch marker bytes in a ByteVec given resolved CP indices. */
+static void patch_markers(ByteVec* bv, int heap_ref, int hp_ref, int alloc_ref,
+                          int sout_ref, int sin_ref, int ps_ref, int ir_ref) {
+  unsigned char* p = bv->data;
+  int k = 0;
+  while (k < bv->size) {
+    unsigned char op = p[k++];
+    if ((op == 0xb2 || op == 0xb3 || op == 0xb6 || op == 0xb8) &&
+        k + 1 < bv->size) {
+      int marker = ((int)p[k] << 8) | p[k + 1];
+      int ref = marker;
+      if (marker == JVM_MARKER_SYS_OUT)  ref = sout_ref;
+      else if (marker == JVM_MARKER_SYS_IN)   ref = sin_ref;
+      else if (marker == JVM_MARKER_PS_PRINT) ref = ps_ref;
+      else if (marker == JVM_MARKER_IS_READ)  ref = ir_ref;
+      else if (marker == JVM_MARKER_HEAP_FIELD) ref = heap_ref;
+      else if (marker == JVM_MARKER_HP_FIELD)   ref = hp_ref;
+      else if (marker == JVM_MARKER_ALLOC_MTH)  ref = alloc_ref;
+      p[k]     = (unsigned char)((ref >> 8) & 0xff);
+      p[k + 1] = (unsigned char)(ref & 0xff);
+      k += 2;
+    } else if (op == 0x10 || op == 0x15 || op == 0x19 || op == 0x36 ||
+               op == 0x3a || op == 0xbc) {
+      k += 1;
+    } else if (op == 0x11 || op == 0xa7 || (op >= 0x99 && op <= 0xa4)) {
+      k += 2;
+    }
+  }
+}
+
 int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
-  const char* class_name = "SimpleLangProgram";
+  const char* class_name = JVM_CLASS_NAME;
   FILE* listing = NULL;
   FILE* out = NULL;
   char* class_path = NULL;
@@ -1301,8 +1859,9 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   int i, j;
   int code_attr, this_class, super_class;
   int system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref;
+  int heap_field_ref, hp_field_ref, alloc_method_ref;
   int wrapper_name, wrapper_desc, user_main_ref;
-  ByteVec wrapper_code;
+  ByteVec wrapper_code, clinit_code, alloc_code;
 
   memset(&cp, 0, sizeof(cp));
   if (!res || !asm_outfile) return 1;
@@ -1311,6 +1870,8 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   if (!listing) return 1;
   fprintf(listing, "; JVM assembly listing generated from SimpleLang CFG\n");
   fprintf(listing, ".class public %s\n.super java/lang/Object\n", class_name);
+  fprintf(listing, ".field public static HEAP [I\n");
+  fprintf(listing, ".field public static HP I\n");
 
   for (i = 0; i < res->files_count; ++i) {
     SourceFileInfo* sf = res->files[i];
@@ -1331,6 +1892,7 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
     }
   }
 
+  /* wrapper: public static main([Ljava/lang/String;)V calls main()I */
   bv_init(&wrapper_code);
   fprintf(listing, "\n.method public static main([Ljava/lang/String;)V\n");
   fprintf(listing, "    invokestatic %s/main()I\n", class_name);
@@ -1338,49 +1900,97 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   fprintf(listing, "    return\n");
   fprintf(listing, "  .limit stack 1\n  .limit locals 1\n.end method\n");
   bv_u1(&wrapper_code, 0xb8);
-  bv_u2(&wrapper_code, 0);
+  bv_u2(&wrapper_code, 0); /* patched to main()I ref */
   bv_u1(&wrapper_code, 0x57);
   bv_u1(&wrapper_code, 0xb1);
+
+  /* static initializer: allocate HEAP int[16384], set HP=0 */
+  bv_init(&clinit_code);
+  fprintf(listing, "\n.method static <clinit>()V\n");
+  fprintf(listing, "    sipush %d\n", JVM_HEAP_SLOTS);
+  fprintf(listing, "    newarray int\n");
+  fprintf(listing, "    putstatic %s/HEAP [I\n", class_name);
+  fprintf(listing, "    iconst_0\n");
+  fprintf(listing, "    putstatic %s/HP I\n", class_name);
+  fprintf(listing, "    return\n.end method\n");
+  bv_u1(&clinit_code, 0x11);
+  bv_u2(&clinit_code, JVM_HEAP_SLOTS);
+  bv_u1(&clinit_code, 0xbc);
+  bv_u1(&clinit_code, 10); /* int */
+  bv_u1(&clinit_code, 0xb3);
+  bv_u2(&clinit_code, JVM_MARKER_HEAP_FIELD); /* putstatic HEAP */
+  bv_u1(&clinit_code, 0x03); /* iconst_0 */
+  bv_u1(&clinit_code, 0xb3);
+  bv_u2(&clinit_code, JVM_MARKER_HP_FIELD);   /* putstatic HP */
+  bv_u1(&clinit_code, 0xb1); /* return */
+
+  /* alloc(int size) -> int: bump allocator on HP */
+  bv_init(&alloc_code);
+  fprintf(listing, "\n.method public static alloc(I)I\n");
+  fprintf(listing, "    getstatic %s/HP I\n", class_name);
+  fprintf(listing, "    dup\n");
+  fprintf(listing, "    iload_0\n");
+  fprintf(listing, "    iadd\n");
+  fprintf(listing, "    putstatic %s/HP I\n", class_name);
+  fprintf(listing, "    ireturn\n.end method\n");
+  bv_u1(&alloc_code, 0xb2);
+  bv_u2(&alloc_code, JVM_MARKER_HP_FIELD);  /* getstatic HP */
+  bv_u1(&alloc_code, 0x59); /* dup */
+  bv_u1(&alloc_code, 0x1a); /* iload_0 */
+  bv_u1(&alloc_code, 0x60); /* iadd */
+  bv_u1(&alloc_code, 0xb3);
+  bv_u2(&alloc_code, JVM_MARKER_HP_FIELD);  /* putstatic HP */
+  bv_u1(&alloc_code, 0xac); /* ireturn */
   fclose(listing);
 
-  code_attr = cp_utf8(&cp, "Code");
-  this_class = cp_class(&cp, class_name);
-  super_class = cp_class(&cp, "java/lang/Object");
-  system_out_ref = cp_ref(&cp, CP_FIELDREF, "java/lang/System", "out",
-                          "Ljava/io/PrintStream;");
-  system_in_ref = cp_ref(&cp, CP_FIELDREF, "java/lang/System", "in",
-                         "Ljava/io/InputStream;");
+  code_attr    = cp_utf8(&cp, "Code");
+  this_class   = cp_class(&cp, class_name);
+  super_class  = cp_class(&cp, "java/lang/Object");
+  system_out_ref    = cp_ref(&cp, CP_FIELDREF, "java/lang/System", "out",
+                             "Ljava/io/PrintStream;");
+  system_in_ref     = cp_ref(&cp, CP_FIELDREF, "java/lang/System", "in",
+                             "Ljava/io/InputStream;");
   ps_print_char_ref = cp_ref(&cp, CP_METHODREF, "java/io/PrintStream", "print",
                              "(C)V");
-  input_read_ref = cp_ref(&cp, CP_METHODREF, "java/io/InputStream", "read", "()I");
-  (void)system_out_ref;
-  (void)system_in_ref;
-  (void)ps_print_char_ref;
-  (void)input_read_ref;
+  input_read_ref    = cp_ref(&cp, CP_METHODREF, "java/io/InputStream", "read", "()I");
+  heap_field_ref    = cp_ref(&cp, CP_FIELDREF, class_name, "HEAP", "[I");
+  hp_field_ref      = cp_ref(&cp, CP_FIELDREF, class_name, "HP", "I");
 
   for (i = 0; i < method_count; ++i) {
     cp_utf8(&cp, methods[i].name);
     cp_utf8(&cp, methods[i].desc);
     cp_ref(&cp, CP_METHODREF, class_name, methods[i].name, methods[i].desc);
   }
-  wrapper_name = cp_utf8(&cp, "main");
-  wrapper_desc = cp_utf8(&cp, "([Ljava/lang/String;)V");
+  /* alloc method ref */
+  alloc_method_ref = cp_ref(&cp, CP_METHODREF, class_name, "alloc", "(I)I");
+
+  wrapper_name  = cp_utf8(&cp, "main");
+  wrapper_desc  = cp_utf8(&cp, "([Ljava/lang/String;)V");
   user_main_ref = cp_ref(&cp, CP_METHODREF, class_name, "main", "()I");
+  /* Pre-add strings needed for <clinit> and alloc method_info,
+     so all name/desc indices are valid when cp_write serializes the CP. */
+  cp_utf8(&cp, "<clinit>");
+  cp_utf8(&cp, "()V");
   bv_patch_u2(&wrapper_code, 1, user_main_ref);
 
+  /* patch user methods */
   for (i = 0; i < method_count; ++i) {
     unsigned char* p = methods[i].code.data;
     int k = 0;
     while (k < methods[i].code.size) {
       unsigned char op = p[k++];
-      if ((op == 0xb2 || op == 0xb6 || op == 0xb8) && k + 1 < methods[i].code.size) {
+      if ((op == 0xb2 || op == 0xb3 || op == 0xb6 || op == 0xb8) &&
+          k + 1 < methods[i].code.size) {
         int marker = ((int)p[k] << 8) | p[k + 1];
         int ref = marker;
-        if (marker == 0xfff1) ref = system_out_ref;
-        else if (marker == 0xfff2) ref = system_in_ref;
-        else if (marker == 0xfff3) ref = ps_print_char_ref;
-        else if (marker == 0xfff4) ref = input_read_ref;
-        else if (marker == 0xfff5) {
+        if (marker == JVM_MARKER_SYS_OUT)  ref = system_out_ref;
+        else if (marker == JVM_MARKER_SYS_IN)   ref = system_in_ref;
+        else if (marker == JVM_MARKER_PS_PRINT) ref = ps_print_char_ref;
+        else if (marker == JVM_MARKER_IS_READ)  ref = input_read_ref;
+        else if (marker == JVM_MARKER_HEAP_FIELD) ref = heap_field_ref;
+        else if (marker == JVM_MARKER_HP_FIELD)   ref = hp_field_ref;
+        else if (marker == JVM_MARKER_ALLOC_MTH)  ref = alloc_method_ref;
+        else if (marker == JVM_MARKER_INVOKE_USR) {
           int q;
           ref = user_main_ref;
           for (q = 0; q < methods[i].invoke_fixup_count; ++q) {
@@ -1392,7 +2002,7 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
             }
           }
         }
-        p[k] = (unsigned char)((ref >> 8) & 0xff);
+        p[k]     = (unsigned char)((ref >> 8) & 0xff);
         p[k + 1] = (unsigned char)(ref & 0xff);
         k += 2;
       } else if (op == 0x10 || op == 0x15 || op == 0x19 || op == 0x36 ||
@@ -1403,6 +2013,11 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
       }
     }
   }
+  /* patch clinit and alloc helper bytecodes */
+  patch_markers(&clinit_code, heap_field_ref, hp_field_ref, alloc_method_ref,
+                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref);
+  patch_markers(&alloc_code, heap_field_ref, hp_field_ref, alloc_method_ref,
+                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref);
 
   class_path = class_path_for_asm(asm_outfile);
   out = fopen(class_path, "wb");
@@ -1411,22 +2026,35 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
     cp_free(&cp);
     free_methods(methods, method_count);
     bv_free(&wrapper_code);
+    bv_free(&clinit_code);
+    bv_free(&alloc_code);
     return 1;
   }
 
   write_u4(out, 0xCAFEBABE);
   write_u2(out, 0);
-  write_u2(out, 49);
+  write_u2(out, 49); /* Java 5 */
   cp_write(out, &cp);
-  write_u2(out, 0x0021);
+  write_u2(out, 0x0021); /* ACC_PUBLIC | ACC_SUPER */
   write_u2(out, this_class);
   write_u2(out, super_class);
+  write_u2(out, 0); /* interfaces */
+  /* fields: HEAP and HP */
+  write_u2(out, 2);
+  write_u2(out, 0x0008); /* ACC_STATIC */
+  write_u2(out, cp_utf8(&cp, "HEAP"));
+  write_u2(out, cp_utf8(&cp, "[I"));
   write_u2(out, 0);
+  write_u2(out, 0x0008);
+  write_u2(out, cp_utf8(&cp, "HP"));
+  write_u2(out, cp_utf8(&cp, "I"));
   write_u2(out, 0);
-  write_u2(out, method_count + 1);
+
+  /* methods: user methods + wrapper + clinit + alloc */
+  write_u2(out, method_count + 3);
 
   for (i = 0; i < method_count; ++i) {
-    write_u2(out, 0x0009);
+    write_u2(out, 0x0009); /* ACC_PUBLIC | ACC_STATIC */
     write_u2(out, cp_utf8(&cp, methods[i].name));
     write_u2(out, cp_utf8(&cp, methods[i].desc));
     write_u2(out, 1);
@@ -1440,6 +2068,7 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
     write_u2(out, 0);
   }
 
+  /* wrapper main([Ljava/lang/String;)V */
   write_u2(out, 0x0009);
   write_u2(out, wrapper_name);
   write_u2(out, wrapper_desc);
@@ -1453,7 +2082,35 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   write_u2(out, 0);
   write_u2(out, 0);
 
+  /* static initializer <clinit>()V */
+  write_u2(out, 0x0008); /* ACC_STATIC */
+  write_u2(out, cp_utf8(&cp, "<clinit>"));
+  write_u2(out, cp_utf8(&cp, "()V"));
+  write_u2(out, 1);
+  write_u2(out, code_attr);
+  write_u4(out, (uint32_t)(12 + clinit_code.size));
+  write_u2(out, 4); /* max_stack */
+  write_u2(out, 0); /* max_locals */
+  write_u4(out, (uint32_t)clinit_code.size);
+  fwrite(clinit_code.data, 1, (size_t)clinit_code.size, out);
   write_u2(out, 0);
+  write_u2(out, 0);
+
+  /* alloc(I)I */
+  write_u2(out, 0x0009);
+  write_u2(out, cp_utf8(&cp, "alloc"));
+  write_u2(out, cp_utf8(&cp, "(I)I"));
+  write_u2(out, 1);
+  write_u2(out, code_attr);
+  write_u4(out, (uint32_t)(12 + alloc_code.size));
+  write_u2(out, 4); /* max_stack: dup + iload_0 + iadd = 3 */
+  write_u2(out, 1); /* max_locals (size param) */
+  write_u4(out, (uint32_t)alloc_code.size);
+  fwrite(alloc_code.data, 1, (size_t)alloc_code.size, out);
+  write_u2(out, 0);
+  write_u2(out, 0);
+
+  write_u2(out, 0); /* no class attributes */
   fclose(out);
 
   fprintf(stderr, "JVM class written to %s\n", class_path);
@@ -1462,5 +2119,7 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   cp_free(&cp);
   free_methods(methods, method_count);
   bv_free(&wrapper_code);
+  bv_free(&clinit_code);
+  bv_free(&alloc_code);
   return 0;
 }
