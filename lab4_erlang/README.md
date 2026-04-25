@@ -35,6 +35,18 @@ call gcd 48 18
 ok 6
 ```
 
+`sl_port:call/2` accepts these Erlang argument forms:
+
+- integers, floats, booleans: `42`, `3.14`, `true`
+- strings: `{string, "text"}`
+- characters: `{char, $A}`
+- one-dimensional arrays: `{array, [1, 2, 3]}`
+
+The current JVM backend emits SimpleLang scalar values as JVM `int`, except `void`.
+The bridge is broader than that on purpose: if the generated class exposes JVM
+`boolean`, `byte`, `short`, `long`, `char`, `float`, `double`, `String`, or
+one-dimensional arrays, the same Erlang port layer can call them.
+
 This keeps the FFI boundary visible for the report and avoids linking unsafe native code into BEAM.
 
 If a custom build directory is used, set `LAB4_CLASSPATH` to that directory before starting Erlang.

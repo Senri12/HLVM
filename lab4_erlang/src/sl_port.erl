@@ -52,7 +52,7 @@ call(#state{port = Port}, {Function, Args}) when is_list(Function), is_list(Args
         {ok, "ok"} ->
             ok;
         {ok, "ok " ++ ValueText} ->
-            {ok, list_to_integer(ValueText)};
+            {ok, parse_value(ValueText)};
         {ok, "error " ++ Reason} ->
             {error, Reason};
         {ok, Other} ->
@@ -63,8 +63,57 @@ call(#state{port = Port}, {Function, Args}) when is_list(Function), is_list(Args
 
 format_args([]) ->
     "";
-format_args([Head | Tail]) when is_integer(Head) ->
-    " " ++ integer_to_list(Head) ++ format_args(Tail).
+format_args([Head | Tail]) ->
+    " " ++ format_arg(Head) ++ format_args(Tail).
+
+format_arg(Value) when is_integer(Value) ->
+    integer_to_list(Value);
+format_arg(Value) when is_float(Value) ->
+    float_to_list(Value);
+format_arg(true) ->
+    "true";
+format_arg(false) ->
+    "false";
+format_arg({char, Value}) when is_integer(Value) ->
+    quote([Value]);
+format_arg({char, [Value]}) when is_integer(Value) ->
+    quote([Value]);
+format_arg({string, Text}) ->
+    quote(Text);
+format_arg({array, Items}) when is_list(Items) ->
+    "[" ++ join_encoded(Items) ++ "]";
+format_arg(Value) when is_atom(Value) ->
+    atom_to_list(Value).
+
+join_encoded([]) ->
+    "";
+join_encoded([Only]) ->
+    format_arg(Only);
+join_encoded([Head | Tail]) ->
+    format_arg(Head) ++ "," ++ join_encoded(Tail).
+
+parse_value("true") ->
+    true;
+parse_value("false") ->
+    false;
+parse_value("null") ->
+    null;
+parse_value([$" | _] = Text) ->
+    unquote(Text);
+parse_value([$[ | _] = Text) ->
+    Text;
+parse_value(Text) ->
+    case string:to_integer(Text) of
+        {Value, []} when is_integer(Value) ->
+            Value;
+        _ ->
+            case string:to_float(Text) of
+                {Value, []} when is_float(Value) ->
+                    Value;
+                _ ->
+                    Text
+            end
+    end.
 
 recv_line(Port, Timeout) ->
     receive
@@ -79,11 +128,35 @@ recv_line(Port, Timeout) ->
     end.
 
 quote(Text) ->
-    "\"" ++ escape_quotes(Text) ++ "\"".
+    "\"" ++ escape_text(Text) ++ "\"".
 
-escape_quotes([]) ->
+escape_text([]) ->
     [];
-escape_quotes([$" | Tail]) ->
-    [$\\, $" | escape_quotes(Tail)];
-escape_quotes([Head | Tail]) ->
-    [Head | escape_quotes(Tail)].
+escape_text([$" | Tail]) ->
+    [$\\, $" | escape_text(Tail)];
+escape_text([$\\ | Tail]) ->
+    [$\\, $\\ | escape_text(Tail)];
+escape_text([$\n | Tail]) ->
+    [$\\, $n | escape_text(Tail)];
+escape_text([$\r | Tail]) ->
+    [$\\, $r | escape_text(Tail)];
+escape_text([$\t | Tail]) ->
+    [$\\, $t | escape_text(Tail)];
+escape_text([Head | Tail]) ->
+    [Head | escape_text(Tail)].
+
+unquote(Text) ->
+    unquote_inner(tl(lists:sublist(Text, length(Text) - 1))).
+
+unquote_inner([]) ->
+    [];
+unquote_inner([$\\, $n | Tail]) ->
+    [$\n | unquote_inner(Tail)];
+unquote_inner([$\\, $r | Tail]) ->
+    [$\r | unquote_inner(Tail)];
+unquote_inner([$\\, $t | Tail]) ->
+    [$\t | unquote_inner(Tail)];
+unquote_inner([$\\, Head | Tail]) ->
+    [Head | unquote_inner(Tail)];
+unquote_inner([Head | Tail]) ->
+    [Head | unquote_inner(Tail)].
