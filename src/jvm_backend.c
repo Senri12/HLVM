@@ -283,8 +283,16 @@ static void local_set_type(JvmMethodGen* g, const char* name, const char* type_n
   if (!g || !name || !type_name) return;
   for (i = 0; i < g->local_count; ++i) {
     if (strcmp(g->locals[i].name, name) == 0) {
+      int was_wide = g->locals[i].type_name &&
+                     (strcmp(g->locals[i].type_name, "long") == 0 ||
+                      strcmp(g->locals[i].type_name, "ulong") == 0);
+      int is_wide = strcmp(type_name, "long") == 0 ||
+                    strcmp(type_name, "ulong") == 0;
       free(g->locals[i].type_name);
       g->locals[i].type_name = jvm_strdup(type_name);
+      if (strcmp(type_name, "string") == 0) g->locals[i].is_ref = 1;
+      if (!was_wide && is_wide && g->locals[i].slot == g->max_locals - 1)
+        g->max_locals++;
       return;
     }
   }
@@ -358,6 +366,82 @@ static void emit_astore(JvmMethodGen* g, int slot) {
     if (g->listing) fprintf(g->listing, "    %s\n", line);
     bv_u1(&g->code, 0x3a);
     bv_u1(&g->code, slot);
+  }
+}
+
+static int jvm_type_is_ref(const char* type_name) {
+  return type_name && strcmp(type_name, "string") == 0;
+}
+
+static int jvm_type_is_long(const char* type_name) {
+  return type_name &&
+         (strcmp(type_name, "long") == 0 || strcmp(type_name, "ulong") == 0);
+}
+
+static void emit_lload(JvmMethodGen* g, int slot) {
+  char line[64];
+  snprintf(line, sizeof(line), "lload %d", slot);
+  if (slot >= 0 && slot <= 3) emit_u1(g, 0x1e + slot, line);
+  else {
+    if (g->listing) fprintf(g->listing, "    %s\n", line);
+    bv_u1(&g->code, 0x16);
+    bv_u1(&g->code, slot);
+  }
+}
+
+static void emit_lstore(JvmMethodGen* g, int slot) {
+  char line[64];
+  snprintf(line, sizeof(line), "lstore %d", slot);
+  if (slot >= 0 && slot <= 3) emit_u1(g, 0x3f + slot, line);
+  else {
+    if (g->listing) fprintf(g->listing, "    %s\n", line);
+    bv_u1(&g->code, 0x37);
+    bv_u1(&g->code, slot);
+  }
+}
+
+static void emit_typed_load(JvmMethodGen* g, const char* name) {
+  const char* type_name = local_get_type(g, name);
+  int slot = local_slot(g, name, 1);
+  if (jvm_type_is_ref(type_name) || local_is_ref(g, name))
+    emit_aload(g, slot);
+  else if (jvm_type_is_long(type_name))
+    emit_lload(g, slot);
+  else
+    emit_iload(g, slot);
+}
+
+static void emit_typed_store(JvmMethodGen* g, const char* name) {
+  const char* type_name = local_get_type(g, name);
+  int slot = local_slot(g, name, 1);
+  if (jvm_type_is_ref(type_name) || local_is_ref(g, name))
+    emit_astore(g, slot);
+  else if (jvm_type_is_long(type_name))
+    emit_lstore(g, slot);
+  else
+    emit_istore(g, slot);
+}
+
+static int jvm_return_opcode(const char* desc) {
+  if (!desc || strcmp(desc, "V") == 0) return 0xb1;
+  if (strcmp(desc, "J") == 0) return 0xad;
+  if (desc[0] == 'L' || desc[0] == '[') return 0xb0;
+  return 0xac;
+}
+
+static const char* jvm_return_mnemonic(const char* desc) {
+  if (!desc || strcmp(desc, "V") == 0) return "return";
+  if (strcmp(desc, "J") == 0) return "lreturn";
+  if (desc[0] == 'L' || desc[0] == '[') return "areturn";
+  return "ireturn";
+}
+
+static void emit_default_value(JvmMethodGen* g, const char* desc) {
+  if (desc && (desc[0] == 'L' || desc[0] == '[')) emit_u1(g, 0x01, "aconst_null");
+  else if (desc && strcmp(desc, "J") == 0) {
+    emit_u1(g, 0x09, "lconst_0");
+  } else {
+    emit_iconst(g, 0);
   }
 }
 
@@ -613,12 +697,13 @@ static char* jvm_func_name(FunctionCFG* f) {
   return jvm_sanitize_name((f && f->func_name) ? f->func_name : "unknown");
 }
 
+static const char* jvm_type_desc(const char* type_name);
+
 static const char* jvm_ret_desc(FunctionCFG* f) {
   /* Async functions always return an int Task handle, regardless of the
      user-visible return type (Task 2 var.1). */
   if (f && f->is_async) return "I";
-  if (f && f->return_type && strcmp(f->return_type, "void") == 0) return "V";
-  return "I";
+  return jvm_type_desc((f && f->return_type) ? f->return_type : "int");
 }
 
 /* Local slot name used to hold the heap handle of the Task this async
@@ -637,6 +722,12 @@ static void emit_async_return_complete(JvmMethodGen* g, const char* expr);
 
 static const char* jvm_type_desc(const char* type_name) {
   if (type_name && strcmp(type_name, "void") == 0) return "V";
+  if (type_name && strcmp(type_name, "bool") == 0) return "Z";
+  if (type_name && strcmp(type_name, "byte") == 0) return "B";
+  if (type_name && strcmp(type_name, "char") == 0) return "C";
+  if (type_name && (strcmp(type_name, "long") == 0 ||
+                    strcmp(type_name, "ulong") == 0)) return "J";
+  if (type_name && strcmp(type_name, "string") == 0) return "Ljava/lang/String;";
   return "I";
 }
 
@@ -1436,7 +1527,7 @@ static void eval_expr(JvmMethodGen* g, const char* expr) {
     emit_iconst(g, value);
     return;
   }
-  emit_iload(g, local_slot(g, work, 1));
+  emit_typed_load(g, work);
 }
 
 static void emit_async_return_complete(JvmMethodGen* g, const char* expr) {
@@ -1546,8 +1637,8 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
         return;
       }
       if (expr[0]) eval_expr(g, expr);
-      else emit_iconst(g, 0);
-      emit_istore(g, local_slot(g, name, 1));
+      else emit_default_value(g, jvm_type_desc(type_name));
+      emit_typed_store(g, name);
     }
     return;
   }
@@ -1563,8 +1654,7 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
       emit_u1(g, 0xb1, "return");
     } else {
       eval_expr(g, p);
-      emit_u1(g, ret_desc[0] == '[' ? 0xb0 : 0xac,
-              ret_desc[0] == '[' ? "areturn" : "ireturn");
+      emit_u1(g, jvm_return_opcode(ret_desc), jvm_return_mnemonic(ret_desc));
     }
     g->terminated = 1;
     return;
@@ -1656,7 +1746,7 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
       return;
     }
     eval_expr(g, expr);
-    emit_istore(g, local_slot(g, name, 1));
+    emit_typed_store(g, name);
   }
 }
 
@@ -1683,10 +1773,8 @@ static void emit_node(JvmMethodGen* g, CFGNode* node) {
         emit_async_return_complete(g, NULL);
       } else if (strcmp(ret_desc, "V") == 0) emit_u1(g, 0xb1, "return");
       else {
-        if (ret_desc[0] == '[') emit_u1(g, 0x01, "aconst_null");
-        else emit_iconst(g, 0);
-        emit_u1(g, ret_desc[0] == '[' ? 0xb0 : 0xac,
-                ret_desc[0] == '[' ? "areturn" : "ireturn");
+        emit_default_value(g, ret_desc);
+        emit_u1(g, jvm_return_opcode(ret_desc), jvm_return_mnemonic(ret_desc));
       }
       g->terminated = 1;
     }
@@ -1772,10 +1860,8 @@ static JvmMethod compile_function(FunctionCFG* f, AnalysisResult* res,
       emit_async_return_complete(&g, NULL);
     } else if (strcmp(ret_desc, "V") == 0) emit_u1(&g, 0xb1, "return");
     else {
-      if (ret_desc[0] == '[') emit_u1(&g, 0x01, "aconst_null");
-      else emit_iconst(&g, 0);
-      emit_u1(&g, ret_desc[0] == '[' ? 0xb0 : 0xac,
-              ret_desc[0] == '[' ? "areturn" : "ireturn");
+      emit_default_value(&g, ret_desc);
+      emit_u1(&g, jvm_return_opcode(ret_desc), jvm_return_mnemonic(ret_desc));
     }
   }
 

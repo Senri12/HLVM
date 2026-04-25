@@ -82,6 +82,8 @@ format_arg({string, Text}) ->
     quote(Text);
 format_arg({array, Items}) when is_list(Items) ->
     "[" ++ join_encoded(Items) ++ "]";
+format_arg({object, _TypeName, Handle}) when is_integer(Handle) ->
+    integer_to_list(Handle);
 format_arg(Value) when is_atom(Value) ->
     atom_to_list(Value).
 

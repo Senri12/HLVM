@@ -22,6 +22,12 @@ The build uses the existing `tools/remote-parser.ps1` pipeline, so the remote pa
 erl -pa build/lab4_app -noshell -s lab4_app demo -s init stop
 ```
 
+## Run type smoke tests
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\test_lab4_types.ps1
+```
+
 ## Run interactive console
 
 ```powershell
@@ -41,11 +47,12 @@ ok 6
 - strings: `{string, "text"}`
 - characters: `{char, $A}`
 - one-dimensional arrays: `{array, [1, 2, 3]}`
+- heap-backed SimpleLang objects: `{object, 'Vec2i', Handle}`
 
-The current JVM backend emits SimpleLang scalar values as JVM `int`, except `void`.
-The bridge is broader than that on purpose: if the generated class exposes JVM
-`boolean`, `byte`, `short`, `long`, `char`, `float`, `double`, `String`, or
-one-dimensional arrays, the same Erlang port layer can call them.
+User-defined SimpleLang types are represented by the JVM backend as integer heap
+handles into `SimpleLangProgram.HEAP`, not as Java objects. A factory function
+such as `makeVec2i/2` returns that handle; it can then be passed back to
+functions that expect `Vec2i`.
 
 This keeps the FFI boundary visible for the report and avoids linking unsafe native code into BEAM.
 

@@ -1,3 +1,17 @@
+class Vec2i {
+    int x;
+    int y;
+
+    void init(int a, int b) {
+        this.x = a;
+        this.y = b;
+    }
+
+    int sum() {
+        return this.x + this.y;
+    }
+}
+
 int absInt(int x) {
     if (x < 0) {
         return 0 - x;
@@ -80,6 +94,48 @@ int sumRange(int a, int b) {
     }
 
     return s;
+}
+
+bool notBool(bool value) {
+    return !value;
+}
+
+char nextChar(char value) {
+    return value + 1;
+}
+
+byte incByte(byte value) {
+    return value + 1;
+}
+
+long echoLong(long value) {
+    return value;
+}
+
+string echoString(string value) {
+    return value;
+}
+
+void acceptMany(bool flag, char letter, byte small, long big, string text) {
+    return;
+}
+
+Vec2i makeVec2i(int x, int y) {
+    Vec2i v;
+    v.init(x, y);
+    return v;
+}
+
+int vecX(Vec2i v) {
+    return v.x;
+}
+
+int vecY(Vec2i v) {
+    return v.y;
+}
+
+int vecSum(Vec2i v) {
+    return v.sum();
 }
 
 int main() {

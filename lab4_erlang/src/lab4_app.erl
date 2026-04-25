@@ -22,7 +22,15 @@ demo() ->
                 print_call(State, lcm, [21, 6]),
                 print_call(State, isPrime, [97]),
                 print_call(State, fib, [10]),
-                print_call(State, sumRange, [1, 10])
+                print_call(State, sumRange, [1, 10]),
+                print_call(State, notBool, [true]),
+                print_call(State, nextChar, [{char, $A}]),
+                print_call(State, incByte, [41]),
+                print_call(State, echoLong, [1234567890123]),
+                print_call(State, echoString, [{string, "hello"}]),
+                print_call(State, acceptMany,
+                           [true, {char, $Z}, 7, 1234567890123, {string, "ok"}]),
+                demo_user_type(State)
             after
                 sl_port:stop(State)
             end;
@@ -85,16 +93,45 @@ read_int(Prompt) ->
 print_call(State, Function, Args) ->
     case sl_port:call(State, {Function, Args}) of
         {ok, Value} ->
-            io:format("~s(~s) = ~p~n", [atom_to_list(Function), join_ints(Args), Value]);
+            io:format("~s(~s) = ~p~n", [atom_to_list(Function), join_args(Args), Value]);
         ok ->
-            io:format("~s(~s) = ok~n", [atom_to_list(Function), join_ints(Args)]);
+            io:format("~s(~s) = ok~n", [atom_to_list(Function), join_args(Args)]);
         {error, Reason} ->
-            io:format("~s(~s) failed: ~p~n", [atom_to_list(Function), join_ints(Args), Reason])
+            io:format("~s(~s) failed: ~p~n", [atom_to_list(Function), join_args(Args), Reason])
     end.
 
-join_ints([]) ->
+join_args([]) ->
     "";
-join_ints([Only]) ->
-    integer_to_list(Only);
-join_ints([Head | Tail]) ->
-    integer_to_list(Head) ++ ", " ++ join_ints(Tail).
+join_args([Only]) ->
+    format_demo_arg(Only);
+join_args([Head | Tail]) ->
+    format_demo_arg(Head) ++ ", " ++ join_args(Tail).
+
+format_demo_arg({char, Value}) when is_integer(Value) ->
+    "'" ++ [Value] ++ "'";
+format_demo_arg({string, Text}) ->
+    "\"" ++ Text ++ "\"";
+format_demo_arg({object, TypeName, Handle}) ->
+    atom_to_list(TypeName) ++ "#" ++ integer_to_list(Handle);
+format_demo_arg(Value) when is_integer(Value) ->
+    integer_to_list(Value);
+format_demo_arg(Value) when is_float(Value) ->
+    float_to_list(Value);
+format_demo_arg(true) ->
+    "true";
+format_demo_arg(false) ->
+    "false";
+format_demo_arg(Value) when is_atom(Value) ->
+    atom_to_list(Value).
+
+demo_user_type(State) ->
+    case sl_port:call(State, {makeVec2i, [12, 30]}) of
+        {ok, Handle} ->
+            Vec = {object, 'Vec2i', Handle},
+            io:format("makeVec2i(12, 30) = ~s~n", [format_demo_arg(Vec)]),
+            print_call(State, vecX, [Vec]),
+            print_call(State, vecY, [Vec]),
+            print_call(State, vecSum, [Vec]);
+        Other ->
+            io:format("makeVec2i(12, 30) failed: ~p~n", [Other])
+    end.
