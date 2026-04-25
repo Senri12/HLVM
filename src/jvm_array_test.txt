@@ -1,0 +1,25 @@
+int sum3(int[] xs) {
+    int s = 0;
+    int i = 0;
+
+    while (i < 3) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+
+    return s;
+}
+
+int main() {
+    int xs[3];
+    int result = 0;
+
+    xs[0] = 1;
+    xs[1] = 2;
+    xs[2] = 3;
+
+    result = sum3(xs);
+    out(result + '0');
+    out('\n');
+    return 0;
+}

@@ -975,6 +975,7 @@ int main(int argc, char* argv[]) {
   const char* dgml_output_file = NULL;
   const char* input_file = NULL;
   const char* progress_file = NULL;
+  const char* target_name = "tacvm13";
   char asm_out[1024];
   int special_status;
   int parse_only = 0;
@@ -995,6 +996,15 @@ int main(int argc, char* argv[]) {
       argi += 2;
       continue;
     }
+    if (strcmp(argv[argi], "--target") == 0) {
+      if (argc <= argi + 1) {
+        fprintf(stderr, "--target requires a backend name\n");
+        return 1;
+      }
+      target_name = argv[argi + 1];
+      argi += 2;
+      continue;
+    }
     break;
   }
 
@@ -1003,7 +1013,7 @@ int main(int argc, char* argv[]) {
 
   if (argc <= argi) {
     fprintf(stderr,
-            "Usage: %s [--parse-only] [--progress-file path] <inputfile> [output.asm] [parse_tree.dgml]\n",
+            "Usage: %s [--parse-only] [--progress-file path] [--target tacvm13|jvm] <inputfile> [output.asm] [parse_tree.dgml]\n",
             argv[0]);
     return 1;
   }
@@ -1110,9 +1120,34 @@ int main(int argc, char* argv[]) {
     /* 1) CFG + CallGraph DGML (как было) */
     write_cfg_callgraph_dgml(res, "cfg_callgraph");
 
-    /* 2) TAC-VM .tac файл на основе CFG */
+    /* 2) Target assembly/binary based on CFG */
     note_progress("main: asm begin");
-    generate_tac_assembly(res, asm_out);
+    if (strcmp(target_name, "jvm") == 0) {
+      if (generate_jvm_classfile(res, asm_out) != 0) {
+        fprintf(stderr, "JVM generation failed\n");
+        free_analysis_result(res);
+        free(sf->filename);
+        free(sf);
+        parser->free(parser);
+        tokens->free(tokens);
+        lexer->free(lexer);
+        input->close(input);
+        return 3;
+      }
+    } else if (strcmp(target_name, "tacvm13") == 0 ||
+               strcmp(target_name, "tac") == 0) {
+      generate_tac_assembly(res, asm_out);
+    } else {
+      fprintf(stderr, "Unknown target '%s'\n", target_name);
+      free_analysis_result(res);
+      free(sf->filename);
+      free(sf);
+      parser->free(parser);
+      tokens->free(tokens);
+      lexer->free(lexer);
+      input->close(input);
+      return 3;
+    }
     note_progress("main: asm end");
     fprintf(stderr, "Assembly written to %s\n", asm_out);
 

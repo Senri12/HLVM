@@ -45,6 +45,24 @@ powershell -ExecutionPolicy Bypass -File .\tools\remotetasks-assemble.ps1 -AsmLi
 powershell -ExecutionPolicy Bypass -File .\tools\remotetasks-run.ps1 -BinaryFile .\build\test_echo.ptptb -DefinitionFile .\src\TacVm13.target.pdsl -RunMode InputFile -InputFile .\build\test_echo.stdin.txt -StdinRegStorage INPUT -StdoutRegStorage OUTPUT -ArchName TacVm13
 ```
 
+### JVM backend smoke-test
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\remote-parser.ps1 -Target jvm -InputFile .\src\test_echo.txt -AsmOutput .\build\jvm\test_echo.jasm -ParseTreeOutput .\build\jvm\test_echo.dgml
+cmd /c "echo Z| java -cp build\jvm SimpleLangProgram"
+javap -classpath build\jvm -c SimpleLangProgram
+```
+
+Дополнительные JVM-проверки:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\remote-parser.ps1 -Target jvm -InputFile .\src\jvm_ops_test.txt -AsmOutput .\build\jvm\ops.jasm -ParseTreeOutput .\build\jvm\ops.dgml
+java -cp build\jvm SimpleLangProgram
+
+powershell -ExecutionPolicy Bypass -File .\tools\remote-parser.ps1 -Target jvm -InputFile .\src\jvm_array_test.txt -AsmOutput .\build\jvm\array.jasm -ParseTreeOutput .\build\jvm\array.dgml
+java -cp build\jvm SimpleLangProgram
+```
+
 ### Лабораторная 4: inspector
 
 `remote-parser.ps1` теперь скачивает `*.asm.sym`, а `remotetasks-assemble.ps1` встраивает в `.ptptb` debug-секцию `simplelang.debug.json`.

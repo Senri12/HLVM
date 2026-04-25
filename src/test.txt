@@ -21,6 +21,44 @@ void print(int arg) {
     return;
 }
 
+int readInt() {
+    int ch = 0;
+    int sign = 1;
+    int x = 0;
+    int tmp = 0;
+
+    ch = readToken();
+
+    if (ch == 0) {
+        return 0;
+    }
+
+    if (ch == '-') {
+        sign = 0 - 1;
+        ch = readToken();
+    }
+
+    while (1) {
+        if (ch < '0') {
+            break;
+        }
+
+        if (ch > '9') {
+            break;
+        }
+
+        x = x * 10;
+        tmp = ch - '0';
+        x = x + tmp;
+
+        ch = in();
+    }
+
+    tmp = x * sign;
+    return tmp;
+}
+
+
 int readToken() {
     while (1) {
         int ch = in();
@@ -58,17 +96,14 @@ int main() {
             return 0;
         }
 
-        int a = readToken();
-        int b = readToken();
+        int a = readInt();
+        int b = readInt();
         if (a == 0) {
             return 0;
         }
         if (b == 0) {
             return 0;
         }
-
-        a = a - '0';
-        b = b - '0';
 
         if (op == '+') {
             int tmp = a + b;

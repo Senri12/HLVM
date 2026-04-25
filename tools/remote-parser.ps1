@@ -5,6 +5,8 @@ param(
     [switch]$ParseOnly,
     [switch]$DebugProgress,
     [string]$ProgressOutput = "",
+    [ValidateSet("tacvm13", "tac", "jvm")]
+    [string]$Target = "tacvm13",
     [int]$RemoteRunTimeoutSeconds = 0,
     [string]$RemoteHost = "localhost",
     [int]$RemotePort = 5555,
@@ -88,6 +90,7 @@ try {
     if ($ProgressOutput) {
         $runArgs += "--progress-file '$remoteProgressPath' "
     }
+    $runArgs += "--target '$Target' "
     $runCommand = "$runPrefix./build/src/parser $runArgs'$remoteInputName' '$remoteAsmPath' '$remoteDgmlPath'"
     if ($RemoteRunTimeoutSeconds -gt 0) {
         $runCommand = "timeout $RemoteRunTimeoutSeconds" + "s " + $runCommand
@@ -97,7 +100,7 @@ try {
         "cd '$remoteDir'",
         "mkdir -p build/src out",
         "java -cp /usr/local/lib/antlr-3.4-complete.jar org.antlr.Tool -o build/src src/SimpleLang.g",
-        "gcc -o build/src/parser src/main.c src/cfg_builder.c build/src/src/*.c -O0 -g -I/usr/local/include -Isrc -Ibuild/src/src -L/usr/local/lib -lantlr3c",
+        "gcc -o build/src/parser src/main.c src/cfg_builder.c src/jvm_backend.c build/src/src/*.c -O0 -g -I/usr/local/include -Isrc -Ibuild/src/src -L/usr/local/lib -lantlr3c",
         $runCommand
     ) -join " && "
 
@@ -119,10 +122,22 @@ try {
         throw "Failed to download generated assembly"
     }
 
+    if ($Target -eq "jvm") {
+        $classOutput = Join-Path (Split-Path -Parent $asmPath) "SimpleLangProgram.class"
+        & $scpExePath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $RemotePort "$sshTarget`:$remoteDir/out/SimpleLangProgram.class" $classOutput | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to download generated JVM class file to $classOutput"
+        } else {
+            Write-Host "JVM class written to $classOutput"
+        }
+    }
+
     $symOutput = "$asmPath.sym"
-    & $scpExePath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $RemotePort "$sshTarget`:$remoteDir/$remoteAsmPath.sym" $symOutput | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Failed to download generated sym file to $symOutput"
+    if ($Target -ne "jvm") {
+        & $scpExePath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $RemotePort "$sshTarget`:$remoteDir/$remoteAsmPath.sym" $symOutput | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to download generated sym file to $symOutput"
+        }
     }
 
     & $scpExePath -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P $RemotePort "$sshTarget`:$remoteDir/$remoteDgmlPath" $dgmlPath
@@ -131,7 +146,7 @@ try {
     }
 
     Write-Host "Assembly written to $asmPath"
-    if (Test-Path -LiteralPath $symOutput) {
+    if ($Target -ne "jvm" -and (Test-Path -LiteralPath $symOutput)) {
         Write-Host "Symbols written to $symOutput"
     }
     Write-Host "Parse tree written to $dgmlPath"

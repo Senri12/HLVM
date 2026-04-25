@@ -117,6 +117,9 @@ AnalysisResult* build_cfg_from_parse_trees(SourceFileInfo** files, int files_cou
 /* Export CFG + callgraph to DGML */
 void write_cfg_callgraph_dgml(struct AnalysisResult* res, const char* filename);
 
+/* Export JVM text listing and a real .class file for the simple JVM backend */
+int generate_jvm_classfile(struct AnalysisResult* res, const char* asm_outfile);
+
 /* Free analysis result */
 void free_analysis_result(AnalysisResult* r);
 

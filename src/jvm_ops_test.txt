@@ -1,0 +1,32 @@
+void printDigit(int x) {
+    out(x + '0');
+    out('\n');
+}
+
+int main() {
+    int a = 6;
+    int b = 3;
+    int c = 0;
+    int d = 0;
+
+    c = a & b;
+    d = a | b;
+    c = c + d;
+    printDigit(c - 8);
+
+    c = a > b;
+    d = b != 0;
+    c = c && d;
+    printDigit(c);
+
+    c = a << 1;
+    c = c / 4;
+    printDigit(c);
+
+    c = a == b;
+    c = !c;
+    printDigit(c);
+
+    out("OK\n");
+    return 0;
+}
