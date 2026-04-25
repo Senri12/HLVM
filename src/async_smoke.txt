@@ -1,0 +1,14 @@
+// Minimal async-await smoke test (Task 2 var.1, JVM target).
+// Expected output: "A\n"
+
+async int hello() {
+    return 'A';
+}
+
+int main() {
+    int t = hello();
+    int v = await t;
+    out(v);
+    out('\n');
+    return 0;
+}

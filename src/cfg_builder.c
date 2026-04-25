@@ -318,6 +318,7 @@ static FunctionCFG* create_function(const char* name, const char* srcfile) {
   f->param_types = NULL;
   f->param_count = 0;
   f->is_method = 0;
+  f->is_async = 0;
   f->nodes = NULL;
   f->node_count = 0;
   f->called_functions = NULL;
@@ -735,6 +736,24 @@ static void node_to_code(TreeNode* tree, char* buf, int bufsize) {
     return;
   }
 
+  /* AWAIT must be handled before the generic postfix-chain logic below,
+     otherwise an `await foo(args)` (children: foo + CALL) is mistakenly
+     rewritten as plain `foo(args)`, losing the await semantics. */
+  if (strcmp(tree->label, "AWAIT") == 0) {
+    strncat(buf, "__await(", bufsize - strlen(buf) - 1);
+    if (tree->child_count > 0) {
+      node_to_code(tree->children[0], buf, bufsize);
+      for (int i = 1; i < tree->child_count; ++i) {
+        if (is_postfix_label(tree->children[i]->label))
+          append_postfix_node(tree->children[i], buf, bufsize);
+        else
+          node_to_code(tree->children[i], buf, bufsize);
+      }
+    }
+    strncat(buf, ")", bufsize - strlen(buf) - 1);
+    return;
+  }
+
   if (tree->child_count > 1) {
     int is_postfix_chain = 1;
     for (int i = 1; i < tree->child_count; ++i) {
@@ -815,7 +834,6 @@ static void node_to_code(TreeNode* tree, char* buf, int bufsize) {
     }
     return;
   }
-
   if (tree->child_count == 0) {
     strncat(buf, tree->label, bufsize - strlen(buf) - 1);
     return;
@@ -1393,6 +1411,17 @@ static void add_method_info(UserTypeInfo* type, const char* source_name,
                          method->param_count);
 }
 
+static int signature_is_async(TreeNode* sig) {
+  if (!sig) return 0;
+  for (int i = 0; i < sig->child_count; ++i) {
+    if (sig->children[i] && sig->children[i]->label &&
+        strcmp(sig->children[i]->label, "ASYNC") == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void parse_signature_info(TreeNode* sig, char** out_name,
                                  char** out_return_type, char*** out_param_names,
                                  char*** out_param_types, int* out_param_count) {
@@ -1401,13 +1430,17 @@ static void parse_signature_info(TreeNode* sig, char** out_name,
   char** param_names = NULL;
   char** param_types = NULL;
   int param_count = 0;
+  int first_typeref_seen = 0;
 
   for (int i = 0; i < sig->child_count; ++i) {
     TreeNode* ch = sig->children[i];
-    if (strcmp(ch->label, "TYPE_REF") == 0 && strcmp(return_type, "int") == 0 &&
-        i == 0) {
+    if (strcmp(ch->label, "ASYNC") == 0) {
+      continue; /* handled separately by signature_is_async */
+    }
+    if (strcmp(ch->label, "TYPE_REF") == 0 && !first_typeref_seen) {
       free(return_type);
       return_type = tree_to_code_dup(ch);
+      first_typeref_seen = 1;
       continue;
     }
     if (strcmp(ch->label, "ARG_LIST") == 0) {
@@ -2459,6 +2492,7 @@ static void build_functions_from_tree(CfgBuilderState* st, TreeNode* t,
     func->source_name = strdup(source_name);
     free(func->return_type);
     func->return_type = strdup(return_type);
+    func->is_async = signature_is_async(sig);
     if (current_type) {
       func->is_method = 1;
       func->owner_type = strdup(current_type->name);

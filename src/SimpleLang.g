@@ -60,6 +60,8 @@ tokens {
     INHERITANCE;
     MEMBER_ACCESS;
     ARRAY_DECL;
+    ASYNC;      // marker for async functions (Task 2 var.1)
+    AWAIT;      // unary expression: await expr
 }
 
 
@@ -69,6 +71,8 @@ BOOL    : 'true' | 'false';
 CLASS   : 'class';
 PUBLIC  : 'public';
 PRIVATE : 'private';
+ASYNC_KW : 'async';
+AWAIT_KW : 'await';
 
 HEX     : '0' ('x'|'X') ('0'..'9'|'a'..'f'|'A'..'F')+;
 
@@ -135,7 +139,7 @@ inheritanceSpec
     ;
 
 member
-    : modifier? (((typeRef ID '(')=> typedMethodDef) | ((ID '(')=> implicitMethodDef) | field)
+    : modifier? (((ASYNC_KW? typeRef ID '(')=> typedMethodDef) | ((ASYNC_KW? ID '(')=> implicitMethodDef) | field)
       -> ^(MEMBER modifier? typedMethodDef? implicitMethodDef? field?)
     ;
 
@@ -158,12 +162,16 @@ funcDef
     ;
 
 typedMethodDef
-    : typeRef ID '(' argList ')' (block | ';')
+    : ASYNC_KW typeRef ID '(' argList ')' (block | ';')
+      -> ^(FUNC_DEF ^(FUNC_SIG ^(ASYNC) typeRef ID argList) block?)
+    | typeRef ID '(' argList ')' (block | ';')
       -> ^(FUNC_DEF ^(FUNC_SIG typeRef ID argList) block?)
     ;
 
 implicitMethodDef
-    : ID '(' argList ')' (block | ';')
+    : ASYNC_KW ID '(' argList ')' (block | ';')
+      -> ^(FUNC_DEF ^(FUNC_SIG ^(ASYNC) ID argList) block?)
+    | ID '(' argList ')' (block | ';')
       -> ^(FUNC_DEF ^(FUNC_SIG ID argList) block?)
     ;
 
@@ -421,7 +429,9 @@ multiplicativeExpr
 
 unaryExpr
 
-    : unaryOp unaryExpr      -> ^(UNARY unaryOp unaryExpr)
+    : AWAIT_KW unaryExpr     -> ^(AWAIT unaryExpr)
+
+    | unaryOp unaryExpr      -> ^(UNARY unaryOp unaryExpr)
 
     | postfixExpr
 

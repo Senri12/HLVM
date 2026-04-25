@@ -370,7 +370,10 @@ enum {
   JVM_MARKER_INVOKE_USR = 0xfff5,
   JVM_MARKER_HEAP_FIELD = 0xfff6,
   JVM_MARKER_HP_FIELD   = 0xfff7,
-  JVM_MARKER_ALLOC_MTH  = 0xfff8
+  JVM_MARKER_ALLOC_MTH  = 0xfff8,
+  /* Task 2 var.1: async-await runtime helpers */
+  JVM_MARKER_AWAIT_MTH         = 0xfff9,
+  JVM_MARKER_TASK_COMPLETE_MTH = 0xfffa
 };
 
 static void emit_invokestatic_user(JvmMethodGen* g, const char* name,
@@ -611,9 +614,26 @@ static char* jvm_func_name(FunctionCFG* f) {
 }
 
 static const char* jvm_ret_desc(FunctionCFG* f) {
+  /* Async functions always return an int Task handle, regardless of the
+     user-visible return type (Task 2 var.1). */
+  if (f && f->is_async) return "I";
   if (f && f->return_type && strcmp(f->return_type, "void") == 0) return "V";
   return "I";
 }
+
+/* Local slot name used to hold the heap handle of the Task this async
+   function will complete on return. */
+#define JVM_ASYNC_TASK_LOCAL "__async_task"
+
+static void emit_invokestatic_marker(JvmMethodGen* g, int marker,
+                                     const char* listing_text) {
+  if (g->listing && listing_text) fprintf(g->listing, "    %s\n", listing_text);
+  bv_u1(&g->code, 0xb8);
+  bv_u2(&g->code, marker);
+}
+
+/* emit_async_return_complete is defined after eval_expr. */
+static void emit_async_return_complete(JvmMethodGen* g, const char* expr);
 
 static const char* jvm_type_desc(const char* type_name) {
   if (type_name && strcmp(type_name, "void") == 0) return "V";
@@ -1179,6 +1199,13 @@ static void eval_call(JvmMethodGen* g, const char* name, char args[][128],
   FunctionCFG* f;
   char* desc;
   char line[512];
+  /* __await(taskHandle) — built-in: read result slot from heap (Task 2 var.1). */
+  if (strcmp(name, "__await") == 0 && argc == 1) {
+    eval_expr(g, args[0]);
+    emit_invokestatic_marker(g, JVM_MARKER_AWAIT_MTH,
+                             "invokestatic " JVM_CLASS_NAME "/__await(I)I");
+    return;
+  }
   if (strcmp(name, "in") == 0 && argc == 0) {
     char* eof_ok = jvm_strdupf("L_jvm_in_ok_%s_%d", jvm_func_name(g->function),
                                g->temp_label_counter++);
@@ -1412,6 +1439,19 @@ static void eval_expr(JvmMethodGen* g, const char* expr) {
   emit_iload(g, local_slot(g, work, 1));
 }
 
+static void emit_async_return_complete(JvmMethodGen* g, const char* expr) {
+  /* Emits: load task, evaluate expr, invokestatic __task_complete(II)I, ireturn.
+     Used for `return EXPR;` inside an async body (Task 2 var.1). */
+  emit_iload(g, local_slot(g, JVM_ASYNC_TASK_LOCAL, 0));
+  if (expr && *expr)
+    eval_expr(g, expr);
+  else
+    emit_iconst(g, 0);
+  emit_invokestatic_marker(g, JVM_MARKER_TASK_COMPLETE_MTH,
+                           "invokestatic " JVM_CLASS_NAME "/__task_complete(II)I");
+  emit_u1(g, 0xac, "ireturn");
+}
+
 static void emit_condition_branch(JvmMethodGen* g, const char* cond,
                                   const char* true_label,
                                   const char* false_label) {
@@ -1516,7 +1556,10 @@ static void emit_statement(JvmMethodGen* g, const char* stmt) {
     const char* ret_desc;
     trim(p);
     ret_desc = jvm_ret_desc(g->function);
-    if (strcmp(ret_desc, "V") == 0 || p[0] == '\0') {
+    if (g->function && g->function->is_async) {
+      /* Async return: complete the Task with the value (or 0 for void). */
+      emit_async_return_complete(g, p);
+    } else if (strcmp(ret_desc, "V") == 0 || p[0] == '\0') {
       emit_u1(g, 0xb1, "return");
     } else {
       eval_expr(g, p);
@@ -1635,7 +1678,10 @@ static void emit_node(JvmMethodGen* g, CFGNode* node) {
   if (node->label && strcmp(node->label, "FINISH") == 0) {
     if (!g->terminated) {
       const char* ret_desc = jvm_ret_desc(g->function);
-      if (strcmp(ret_desc, "V") == 0) emit_u1(g, 0xb1, "return");
+      if (g->function && g->function->is_async) {
+        /* Implicit fall-off: complete task with 0 (Task 2 var.1). */
+        emit_async_return_complete(g, NULL);
+      } else if (strcmp(ret_desc, "V") == 0) emit_u1(g, 0xb1, "return");
       else {
         if (ret_desc[0] == '[') emit_u1(g, 0x01, "aconst_null");
         else emit_iconst(g, 0);
@@ -1707,11 +1753,24 @@ static JvmMethod compile_function(FunctionCFG* f, AnalysisResult* res,
       local_set_type(&g, f->params[i], f->param_types[i]);
   }
 
+  /* Async prologue: allocate a 2-slot Task on the heap and stash its handle in
+     a hidden local. Layout: HEAP[handle+0]=done flag, HEAP[handle+1]=result.
+     The Task is filled in by __task_complete() at every return path. */
+  if (f && f->is_async) {
+    int task_slot = local_slot(&g, JVM_ASYNC_TASK_LOCAL, 1);
+    local_set_type(&g, JVM_ASYNC_TASK_LOCAL, "Task");
+    emit_iconst(&g, 2);
+    emit_alloc_call(&g);
+    emit_istore(&g, task_slot);
+  }
+
   for (i = 0; i < f->node_count; ++i) emit_node(&g, f->nodes[i]);
 
   if (!g.terminated) {
     const char* ret_desc = jvm_ret_desc(f);
-    if (strcmp(ret_desc, "V") == 0) emit_u1(&g, 0xb1, "return");
+    if (f && f->is_async) {
+      emit_async_return_complete(&g, NULL);
+    } else if (strcmp(ret_desc, "V") == 0) emit_u1(&g, 0xb1, "return");
     else {
       if (ret_desc[0] == '[') emit_u1(&g, 0x01, "aconst_null");
       else emit_iconst(&g, 0);
@@ -1820,7 +1879,8 @@ static void free_methods(JvmMethod* methods, int count) {
 
 /* Patch marker bytes in a ByteVec given resolved CP indices. */
 static void patch_markers(ByteVec* bv, int heap_ref, int hp_ref, int alloc_ref,
-                          int sout_ref, int sin_ref, int ps_ref, int ir_ref) {
+                          int sout_ref, int sin_ref, int ps_ref, int ir_ref,
+                          int await_ref, int task_complete_ref) {
   unsigned char* p = bv->data;
   int k = 0;
   while (k < bv->size) {
@@ -1836,6 +1896,8 @@ static void patch_markers(ByteVec* bv, int heap_ref, int hp_ref, int alloc_ref,
       else if (marker == JVM_MARKER_HEAP_FIELD) ref = heap_ref;
       else if (marker == JVM_MARKER_HP_FIELD)   ref = hp_ref;
       else if (marker == JVM_MARKER_ALLOC_MTH)  ref = alloc_ref;
+      else if (marker == JVM_MARKER_AWAIT_MTH)         ref = await_ref;
+      else if (marker == JVM_MARKER_TASK_COMPLETE_MTH) ref = task_complete_ref;
       p[k]     = (unsigned char)((ref >> 8) & 0xff);
       p[k + 1] = (unsigned char)(ref & 0xff);
       k += 2;
@@ -1860,8 +1922,9 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   int code_attr, this_class, super_class;
   int system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref;
   int heap_field_ref, hp_field_ref, alloc_method_ref;
+  int await_method_ref, task_complete_method_ref;
   int wrapper_name, wrapper_desc, user_main_ref;
-  ByteVec wrapper_code, clinit_code, alloc_code;
+  ByteVec wrapper_code, clinit_code, alloc_code, await_code, task_complete_code;
 
   memset(&cp, 0, sizeof(cp));
   if (!res || !asm_outfile) return 1;
@@ -1941,6 +2004,62 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   bv_u1(&alloc_code, 0xb3);
   bv_u2(&alloc_code, JVM_MARKER_HP_FIELD);  /* putstatic HP */
   bv_u1(&alloc_code, 0xac); /* ireturn */
+
+  /* __await(int handle) -> int: returns HEAP[handle+1] (Task 2 var.1).
+     The Task layout is { done, result }. Async functions complete the Task
+     synchronously before returning the handle, so __await() simply reads the
+     stored result slot. */
+  bv_init(&await_code);
+  fprintf(listing, "\n.method public static __await(I)I\n");
+  fprintf(listing, "    getstatic %s/HEAP [I\n", class_name);
+  fprintf(listing, "    iload_0\n");
+  fprintf(listing, "    iconst_1\n");
+  fprintf(listing, "    iadd\n");
+  fprintf(listing, "    iaload\n");
+  fprintf(listing, "    ireturn\n.end method\n");
+  bv_u1(&await_code, 0xb2);
+  bv_u2(&await_code, JVM_MARKER_HEAP_FIELD); /* getstatic HEAP */
+  bv_u1(&await_code, 0x1a);                  /* iload_0 */
+  bv_u1(&await_code, 0x04);                  /* iconst_1 */
+  bv_u1(&await_code, 0x60);                  /* iadd */
+  bv_u1(&await_code, 0x2e);                  /* iaload */
+  bv_u1(&await_code, 0xac);                  /* ireturn */
+
+  /* __task_complete(int task, int result) -> int: stores result, sets done=1,
+     returns task handle. Used as the tail call of every async return path. */
+  bv_init(&task_complete_code);
+  fprintf(listing, "\n.method public static __task_complete(II)I\n");
+  fprintf(listing, "    getstatic %s/HEAP [I\n", class_name);
+  fprintf(listing, "    iload_0\n");
+  fprintf(listing, "    iconst_1\n");
+  fprintf(listing, "    iadd\n");
+  fprintf(listing, "    iload_1\n");
+  fprintf(listing, "    iastore\n");
+  fprintf(listing, "    getstatic %s/HEAP [I\n", class_name);
+  fprintf(listing, "    iload_0\n");
+  fprintf(listing, "    iconst_0\n");
+  fprintf(listing, "    iadd\n");
+  fprintf(listing, "    iconst_1\n");
+  fprintf(listing, "    iastore\n");
+  fprintf(listing, "    iload_0\n");
+  fprintf(listing, "    ireturn\n.end method\n");
+  bv_u1(&task_complete_code, 0xb2);
+  bv_u2(&task_complete_code, JVM_MARKER_HEAP_FIELD); /* getstatic HEAP */
+  bv_u1(&task_complete_code, 0x1a); /* iload_0 (task) */
+  bv_u1(&task_complete_code, 0x04); /* iconst_1 */
+  bv_u1(&task_complete_code, 0x60); /* iadd */
+  bv_u1(&task_complete_code, 0x1b); /* iload_1 (result) */
+  bv_u1(&task_complete_code, 0x4f); /* iastore */
+  bv_u1(&task_complete_code, 0xb2);
+  bv_u2(&task_complete_code, JVM_MARKER_HEAP_FIELD); /* getstatic HEAP */
+  bv_u1(&task_complete_code, 0x1a); /* iload_0 */
+  bv_u1(&task_complete_code, 0x03); /* iconst_0 */
+  bv_u1(&task_complete_code, 0x60); /* iadd */
+  bv_u1(&task_complete_code, 0x04); /* iconst_1 (done flag) */
+  bv_u1(&task_complete_code, 0x4f); /* iastore */
+  bv_u1(&task_complete_code, 0x1a); /* iload_0 */
+  bv_u1(&task_complete_code, 0xac); /* ireturn */
+
   fclose(listing);
 
   code_attr    = cp_utf8(&cp, "Code");
@@ -1963,6 +2082,10 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   }
   /* alloc method ref */
   alloc_method_ref = cp_ref(&cp, CP_METHODREF, class_name, "alloc", "(I)I");
+  /* async-await runtime helpers (Task 2 var.1) */
+  await_method_ref = cp_ref(&cp, CP_METHODREF, class_name, "__await", "(I)I");
+  task_complete_method_ref =
+      cp_ref(&cp, CP_METHODREF, class_name, "__task_complete", "(II)I");
 
   wrapper_name  = cp_utf8(&cp, "main");
   wrapper_desc  = cp_utf8(&cp, "([Ljava/lang/String;)V");
@@ -1990,6 +2113,8 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
         else if (marker == JVM_MARKER_HEAP_FIELD) ref = heap_field_ref;
         else if (marker == JVM_MARKER_HP_FIELD)   ref = hp_field_ref;
         else if (marker == JVM_MARKER_ALLOC_MTH)  ref = alloc_method_ref;
+        else if (marker == JVM_MARKER_AWAIT_MTH)         ref = await_method_ref;
+        else if (marker == JVM_MARKER_TASK_COMPLETE_MTH) ref = task_complete_method_ref;
         else if (marker == JVM_MARKER_INVOKE_USR) {
           int q;
           ref = user_main_ref;
@@ -2013,11 +2138,20 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
       }
     }
   }
-  /* patch clinit and alloc helper bytecodes */
+  /* patch clinit, alloc, and the async-await helper bytecodes */
   patch_markers(&clinit_code, heap_field_ref, hp_field_ref, alloc_method_ref,
-                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref);
+                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref,
+                await_method_ref, task_complete_method_ref);
   patch_markers(&alloc_code, heap_field_ref, hp_field_ref, alloc_method_ref,
-                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref);
+                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref,
+                await_method_ref, task_complete_method_ref);
+  patch_markers(&await_code, heap_field_ref, hp_field_ref, alloc_method_ref,
+                system_out_ref, system_in_ref, ps_print_char_ref, input_read_ref,
+                await_method_ref, task_complete_method_ref);
+  patch_markers(&task_complete_code, heap_field_ref, hp_field_ref,
+                alloc_method_ref, system_out_ref, system_in_ref,
+                ps_print_char_ref, input_read_ref, await_method_ref,
+                task_complete_method_ref);
 
   class_path = class_path_for_asm(asm_outfile);
   out = fopen(class_path, "wb");
@@ -2028,6 +2162,8 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
     bv_free(&wrapper_code);
     bv_free(&clinit_code);
     bv_free(&alloc_code);
+    bv_free(&await_code);
+    bv_free(&task_complete_code);
     return 1;
   }
 
@@ -2050,8 +2186,8 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   write_u2(out, cp_utf8(&cp, "I"));
   write_u2(out, 0);
 
-  /* methods: user methods + wrapper + clinit + alloc */
-  write_u2(out, method_count + 3);
+  /* methods: user methods + wrapper + clinit + alloc + __await + __task_complete */
+  write_u2(out, method_count + 5);
 
   for (i = 0; i < method_count; ++i) {
     write_u2(out, 0x0009); /* ACC_PUBLIC | ACC_STATIC */
@@ -2110,6 +2246,34 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   write_u2(out, 0);
   write_u2(out, 0);
 
+  /* __await(I)I — async-await runtime helper (Task 2 var.1) */
+  write_u2(out, 0x0009);
+  write_u2(out, cp_utf8(&cp, "__await"));
+  write_u2(out, cp_utf8(&cp, "(I)I"));
+  write_u2(out, 1);
+  write_u2(out, code_attr);
+  write_u4(out, (uint32_t)(12 + await_code.size));
+  write_u2(out, 4); /* max_stack */
+  write_u2(out, 1); /* max_locals */
+  write_u4(out, (uint32_t)await_code.size);
+  fwrite(await_code.data, 1, (size_t)await_code.size, out);
+  write_u2(out, 0);
+  write_u2(out, 0);
+
+  /* __task_complete(II)I — async-await runtime helper (Task 2 var.1) */
+  write_u2(out, 0x0009);
+  write_u2(out, cp_utf8(&cp, "__task_complete"));
+  write_u2(out, cp_utf8(&cp, "(II)I"));
+  write_u2(out, 1);
+  write_u2(out, code_attr);
+  write_u4(out, (uint32_t)(12 + task_complete_code.size));
+  write_u2(out, 5); /* max_stack: HEAP, task, +1, result = up to 4 + a slack */
+  write_u2(out, 2); /* max_locals: task + result */
+  write_u4(out, (uint32_t)task_complete_code.size);
+  fwrite(task_complete_code.data, 1, (size_t)task_complete_code.size, out);
+  write_u2(out, 0);
+  write_u2(out, 0);
+
   write_u2(out, 0); /* no class attributes */
   fclose(out);
 
@@ -2121,5 +2285,7 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   bv_free(&wrapper_code);
   bv_free(&clinit_code);
   bv_free(&alloc_code);
+  bv_free(&await_code);
+  bv_free(&task_complete_code);
   return 0;
 }

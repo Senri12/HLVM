@@ -91,6 +91,7 @@ typedef struct FunctionCFG {
     char** param_types;
     int param_count;
     int is_method;
+    int is_async;       /* Task 2 var.1: function declared with `async` */
     char** called_functions;
     int called_count;
 } FunctionCFG;
