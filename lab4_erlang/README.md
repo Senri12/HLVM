@@ -57,3 +57,7 @@ functions that expect `Vec2i`.
 This keeps the FFI boundary visible for the report and avoids linking unsafe native code into BEAM.
 
 If a custom build directory is used, set `LAB4_CLASSPATH` to that directory before starting Erlang.
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\test_lab4_types.ps1 -BuildDir build/lab4_user_types_real -SkipBuild
+```
