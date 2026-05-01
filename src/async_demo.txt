@@ -1,0 +1,57 @@
+// More demonstrative async-await example (Task 2 var.1, JVM target).
+// Expected output:
+// A=7
+// B=8
+// C=3
+// R=4
+//
+// What it shows:
+// - async functions return Task handles, so several tasks can be started first;
+// - await may be used later, in a different order than creation;
+// - async functions may await other async functions;
+// - awaiting the same completed task again returns the stored result.
+
+void printDigitLine(int label, int value) {
+    out(label);
+    out('=');
+    out(value + '0');
+    out('\n');
+}
+
+async int loadBase(int seed) {
+    return seed + 1;
+}
+
+async int addAsync(int left, int right) {
+    return left + right;
+}
+
+async int pipeline(int seed) {
+    int baseTask = loadBase(seed);
+    int base = await baseTask;
+    int sumTask = addAsync(base, seed);
+    int sum = await sumTask;
+    return sum;
+}
+
+async int fanIn(int firstTask, int secondTask) {
+    int first = await firstTask;
+    int second = await secondTask;
+    return first + second;
+}
+
+int main() {
+    int taskA = pipeline(3);       // (3 + 1) + 3 = 7
+    int taskB = pipeline(4);       // (4 + 1) + 4 = 9
+    int taskC = addAsync(1, 2);    // 3
+
+    int joinTask = fanIn(taskA, taskC);
+    int join = await joinTask;     // 7 + 3 = 10
+
+    printDigitLine('A', await taskA);
+    printDigitLine('B', await taskB - 1);
+    printDigitLine('C', await taskC);
+    printDigitLine('R', join - 6);
+
+    return 0;
+}
