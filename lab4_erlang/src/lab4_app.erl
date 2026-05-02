@@ -125,9 +125,8 @@ format_demo_arg(Value) when is_atom(Value) ->
     atom_to_list(Value).
 
 demo_user_type(State) ->
-    case sl_port:call(State, {makeVec2i, [12, 30]}) of
-        {ok, Handle} ->
-            Vec = {object, 'Vec2i', Handle},
+    case sl_port:call_object(State, 'Vec2i', {makeVec2i, [12, 30]}) of
+        {ok, Vec} ->
             io:format("makeVec2i(12, 30) = ~s~n", [format_demo_arg(Vec)]),
             print_call(State, vecX, [Vec]),
             print_call(State, vecY, [Vec]),

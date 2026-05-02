@@ -4,12 +4,27 @@ import java.lang.reflect.Array;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.rmi.Remote;
 
 public final class SlBridge {
     private static final String GENERATED_CLASS = "SimpleLangProgram";
+    private static final Map<Integer, RemoteObjectRef> REMOTE_OBJECTS = new HashMap<Integer, RemoteObjectRef>();
+    private static int nextRemoteObjectId = 0;
 
     private SlBridge() {
+    }
+
+    private static final class RemoteObjectRef implements Remote {
+        private final String typeName;
+        private final int heapHandle;
+
+        private RemoteObjectRef(String typeName, int heapHandle) {
+            this.typeName = typeName;
+            this.heapHandle = heapHandle;
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -41,15 +56,49 @@ public final class SlBridge {
 
     private static String handle(String line) throws Exception {
         List<String> parts = splitCommand(line);
-        if (parts.size() < 2 || !"call".equals(parts.get(0))) {
-            return "error expected: call <function> [args...]";
+        if (parts.size() < 2) {
+            return "error expected: call <function> [args...] or new <type> <function> [args...]";
+        }
+
+        if ("new".equals(parts.get(0))) {
+            if (parts.size() < 3) {
+                return "error expected: new <type> <function> [args...]";
+            }
+            String typeName = parts.get(1);
+            String functionName = parts.get(2);
+            List<String> argTokens = parts.subList(3, parts.size());
+            Object result = invokeGenerated(functionName, argTokens);
+            if (!(result instanceof Number)) {
+                return "error constructor function did not return a heap handle";
+            }
+            int heapHandle = ((Number) result).intValue();
+            int remoteId = nextRemoteObjectId++;
+            REMOTE_OBJECTS.put(Integer.valueOf(remoteId), new RemoteObjectRef(typeName, heapHandle));
+            return "ok @" + remoteId;
+        }
+
+        if (!"call".equals(parts.get(0))) {
+            return "error expected: call <function> [args...] or new <type> <function> [args...]";
         }
 
         String functionName = parts.get(1);
         List<String> argTokens = parts.subList(2, parts.size());
+        Method method = findGeneratedMethod(Class.forName(GENERATED_CLASS), functionName, argTokens);
+        Object result = invokeGenerated(method, argTokens);
 
+        if (method.getReturnType() == Void.TYPE) {
+            return "ok";
+        }
+        return "ok " + formatValue(result);
+    }
+
+    private static Object invokeGenerated(String functionName, List<String> argTokens) throws Exception {
         Class<?> generatedClass = Class.forName(GENERATED_CLASS);
         Method method = findGeneratedMethod(generatedClass, functionName, argTokens);
+        return invokeGenerated(method, argTokens);
+    }
+
+    private static Object invokeGenerated(Method method, List<String> argTokens) throws Exception {
         Object[] values = convertArguments(method.getParameterTypes(), argTokens);
         Object result;
         try {
@@ -58,11 +107,7 @@ public final class SlBridge {
             Throwable cause = ex.getCause();
             throw new Exception(cause == null ? ex.toString() : cause.toString());
         }
-
-        if (method.getReturnType() == Void.TYPE) {
-            return "ok";
-        }
-        return "ok " + formatValue(result);
+        return result;
     }
 
     public static String functions() throws ClassNotFoundException {
@@ -124,6 +169,13 @@ public final class SlBridge {
     }
 
     private static Object convertValue(Class<?> type, String token) {
+        if (token.startsWith("@")) {
+            RemoteObjectRef ref = resolveRemoteObject(token);
+            if (type == Integer.TYPE || type == Integer.class) {
+                return Integer.valueOf(ref.heapHandle);
+            }
+            throw new IllegalArgumentException("remote object " + token + " cannot be passed as " + type.getName());
+        }
         if (type == String.class) {
             return parseString(token);
         }
@@ -165,6 +217,20 @@ public final class SlBridge {
             return parseArray(type.getComponentType(), token);
         }
         throw new IllegalArgumentException("unsupported JVM parameter type: " + type.getName());
+    }
+
+    private static RemoteObjectRef resolveRemoteObject(String token) {
+        int remoteId;
+        try {
+            remoteId = Integer.parseInt(token.substring(1));
+        } catch (NumberFormatException ex) {
+            throw new IllegalArgumentException("invalid remote object reference: " + token);
+        }
+        RemoteObjectRef ref = REMOTE_OBJECTS.get(Integer.valueOf(remoteId));
+        if (ref == null) {
+            throw new IllegalArgumentException("unknown remote object reference: " + token);
+        }
+        return ref;
     }
 
     private static Object parseArray(Class<?> componentType, String token) {

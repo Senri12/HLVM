@@ -1290,7 +1290,7 @@ static void eval_call(JvmMethodGen* g, const char* name, char args[][128],
   FunctionCFG* f;
   char* desc;
   char line[512];
-  /* __await(taskHandle) — built-in: read result slot from heap (Task 2 var.1). */
+  /* __await(taskHandle) — built-in lowered await helper (Task 2 var.1). */
   if (strcmp(name, "__await") == 0 && argc == 1) {
     eval_expr(g, args[0]);
     emit_invokestatic_marker(g, JVM_MARKER_AWAIT_MTH,
@@ -2091,12 +2091,16 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   bv_u2(&alloc_code, JVM_MARKER_HP_FIELD);  /* putstatic HP */
   bv_u1(&alloc_code, 0xac); /* ireturn */
 
-  /* __await(int handle) -> int: returns HEAP[handle+1] (Task 2 var.1).
-     The Task layout is { done, result }. Async functions complete the Task
-     synchronously before returning the handle, so __await() simply reads the
-     stored result slot. */
+  /* __await(int handle) -> int: waits until HEAP[handle+0] is non-zero, then
+     returns HEAP[handle+1].  This is deliberately implemented as our own
+     low-level heap protocol, not with Java async/concurrency library classes. */
   bv_init(&await_code);
   fprintf(listing, "\n.method public static __await(I)I\n");
+  fprintf(listing, "L___await_wait:\n");
+  fprintf(listing, "    getstatic %s/HEAP [I\n", class_name);
+  fprintf(listing, "    iload_0\n");
+  fprintf(listing, "    iaload\n");
+  fprintf(listing, "    ifeq L___await_wait\n");
   fprintf(listing, "    getstatic %s/HEAP [I\n", class_name);
   fprintf(listing, "    iload_0\n");
   fprintf(listing, "    iconst_1\n");
@@ -2106,9 +2110,15 @@ int generate_jvm_classfile(AnalysisResult* res, const char* asm_outfile) {
   bv_u1(&await_code, 0xb2);
   bv_u2(&await_code, JVM_MARKER_HEAP_FIELD); /* getstatic HEAP */
   bv_u1(&await_code, 0x1a);                  /* iload_0 */
+  bv_u1(&await_code, 0x2e);                  /* iaload (done flag) */
+  bv_u1(&await_code, 0x99);                  /* ifeq L___await_wait */
+  bv_u2(&await_code, 0xfffb);                /* branch from pc=5 to pc=0 */
+  bv_u1(&await_code, 0xb2);
+  bv_u2(&await_code, JVM_MARKER_HEAP_FIELD); /* getstatic HEAP */
+  bv_u1(&await_code, 0x1a);                  /* iload_0 */
   bv_u1(&await_code, 0x04);                  /* iconst_1 */
   bv_u1(&await_code, 0x60);                  /* iadd */
-  bv_u1(&await_code, 0x2e);                  /* iaload */
+  bv_u1(&await_code, 0x2e);                  /* iaload (result) */
   bv_u1(&await_code, 0xac);                  /* ireturn */
 
   /* __task_complete(int task, int result) -> int: stores result, sets done=1,

@@ -1,15 +1,15 @@
-// More demonstrative async-await example (Task 2 var.1, JVM target).
+// Custom async-await example (Task 2 var.1, JVM target).
 // Expected output:
 // A=7
 // B=8
 // C=3
 // R=4
 //
-// What it shows:
-// - async functions return Task handles, so several tasks can be started first;
-// - await may be used later, in a different order than creation;
-// - async functions may await other async functions;
-// - awaiting the same completed task again returns the stored result.
+// This uses the source-level `async` and `await` syntax required by the task.
+// The compiler implements it itself: it does not use Java CompletableFuture,
+// Java threads, or any host-language async runtime. Async functions are lowered
+// to integer Task handles in the generated HEAP, and await is lowered to the
+// generated low-level __await helper.
 
 void printDigitLine(int label, int value) {
     out(label);

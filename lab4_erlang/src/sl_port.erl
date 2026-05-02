@@ -1,6 +1,6 @@
 -module(sl_port).
 
--export([start/0, start/1, stop/1, call/2]).
+-export([start/0, start/1, stop/1, call/2, call_object/3]).
 
 -record(state, {port}).
 
@@ -61,6 +61,31 @@ call(#state{port = Port}, {Function, Args}) when is_list(Function), is_list(Args
             Error
     end.
 
+call_object(#state{port = Port}, TypeName, {Function, Args}) when is_atom(TypeName), is_atom(Function), is_list(Args) ->
+    call_object(#state{port = Port}, atom_to_list(TypeName), {atom_to_list(Function), Args});
+call_object(#state{port = Port}, TypeName, {Function, Args}) when is_atom(TypeName), is_list(Function), is_list(Args) ->
+    call_object(#state{port = Port}, atom_to_list(TypeName), {Function, Args});
+call_object(#state{port = Port}, TypeName, {Function, Args}) when is_list(TypeName), is_atom(Function), is_list(Args) ->
+    call_object(#state{port = Port}, TypeName, {atom_to_list(Function), Args});
+call_object(#state{port = Port}, TypeName, {Function, Args}) when is_list(TypeName), is_list(Function), is_list(Args) ->
+    Line = "new " ++ TypeName ++ " " ++ Function ++ format_args(Args) ++ "\n",
+    port_command(Port, Line),
+    case recv_line(Port, 5000) of
+        {ok, "ok @" ++ RefText} ->
+            case string:to_integer(RefText) of
+                {RemoteId, []} when is_integer(RemoteId) ->
+                    {ok, {object, list_to_atom(TypeName), RemoteId}};
+                _ ->
+                    {error, {bad_remote_reference, RefText}}
+            end;
+        {ok, "error " ++ Reason} ->
+            {error, Reason};
+        {ok, Other} ->
+            {error, {unexpected_response, Other}};
+        Error ->
+            Error
+    end.
+
 format_args([]) ->
     "";
 format_args([Head | Tail]) ->
@@ -82,8 +107,8 @@ format_arg({string, Text}) ->
     quote(Text);
 format_arg({array, Items}) when is_list(Items) ->
     "[" ++ join_encoded(Items) ++ "]";
-format_arg({object, _TypeName, Handle}) when is_integer(Handle) ->
-    integer_to_list(Handle);
+format_arg({object, _TypeName, RemoteId}) when is_integer(RemoteId) ->
+    "@" ++ integer_to_list(RemoteId);
 format_arg(Value) when is_atom(Value) ->
     atom_to_list(Value).
 

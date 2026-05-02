@@ -28,6 +28,24 @@ erl -pa build/lab4_app -noshell -s lab4_app demo -s init stop
 powershell -ExecutionPolicy Bypass -File .\scripts\test_lab4_types.ps1
 ```
 
+## Run pure Java remote-reference demo
+
+```powershell
+javac -d build/lab4_app lab4_erlang/priv/java/RemoteFileDemo.java
+java -cp build/lab4_app RemoteFileDemo build/lab4_remote_file_demo.txt
+```
+
+The demo keeps an open file inside a Java object implementing
+`java.rmi.Remote`, stores that object in a static reference table, forces
+`System.gc()`, and then writes another line through the saved reference id.
+
+Interactive mode opens the file once and appends every entered line through the
+same saved reference until `quit`:
+
+```powershell
+java -cp build/lab4_app RemoteFileDemo build/lab4_remote_file_demo.txt --interactive
+```
+
 ## Run interactive console
 
 ```powershell
@@ -47,12 +65,15 @@ ok 6
 - strings: `{string, "text"}`
 - characters: `{char, $A}`
 - one-dimensional arrays: `{array, [1, 2, 3]}`
-- heap-backed SimpleLang objects: `{object, 'Vec2i', Handle}`
+- remote SimpleLang object references: `{object, 'Vec2i', RemoteId}`
 
 User-defined SimpleLang types are represented by the JVM backend as integer heap
-handles into `SimpleLangProgram.HEAP`, not as Java objects. A factory function
-such as `makeVec2i/2` returns that handle; it can then be passed back to
-functions that expect `Vec2i`.
+handles into `SimpleLangProgram.HEAP`, not as Java objects. `SlBridge` wraps such
+a handle in a Java object implementing `java.rmi.Remote`, stores a strong
+reference to it in the bridge process, and returns only a remote reference id to
+Erlang. A factory function such as `makeVec2i/2` is called through
+`sl_port:call_object/3`; the returned `{object, TypeName, RemoteId}` can then be
+passed back to functions that expect `Vec2i`.
 
 This keeps the FFI boundary visible for the report and avoids linking unsafe native code into BEAM.
 
